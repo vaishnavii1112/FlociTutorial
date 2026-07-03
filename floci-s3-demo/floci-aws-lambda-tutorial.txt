@@ -1,0 +1,261 @@
+# Floci for Python: Run a Local Serverless AWS Lambda Function with a Zip Deploy, Synchronous Invoke, and an SQS Event Trigger
+
+In this tutorial, we build a complete AWS Lambda workflow that runs entirely on our own machine using **Floci**, a free, open-source, drop-in local AWS emulator that speaks the real AWS wire protocol on `http://localhost:4566`. Floci runs Lambda in real Docker containers, so the functions we deploy execute in a genuine Lambda runtime rather than a shallow mock. We begin by starting a Floci container with access to the Docker socket, then connect the `boto3` Lambda, IAM, SQS, and CloudWatch Logs clients. We create an execution role, package a small Python handler into an in-memory zip, and deploy it as a Lambda function, waiting until it becomes active. We invoke the function synchronously and read its JSON response. We then attach an event trigger by creating an SQS queue and an event source mapping, so that messages sent to the queue are automatically delivered to the function in batches. We confirm the trigger fired by watching the queue drain and by reading the function's CloudWatch logs. Finally, we tear down the mapping, function, queue, and role, closing the loop on a full deploy-invoke-trigger lifecycle, all without an AWS account, an auth token, or a single cent of cloud spend.
+
+Because Floci implements the same API responses that `boto3` expects, everything you write here transfers directly to real AWS by changing only the endpoint.
+
+## Starting Floci with Docker Access and Connecting the Clients
+
+```bash
+# Lambda runs as real Docker containers, so Floci needs the Docker socket.
+docker run -d --name floci \
+  -p 4566:4566 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  floci/floci:latest
+
+# Confirm it is healthy
+curl http://localhost:4566/_floci/health
+
+# Install the AWS SDK for Python
+pip install boto3
+```
+
+```python
+import os
+import io
+import json
+import time
+import zipfile
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+FLOCI_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+SESSION = boto3.session.Session(
+    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+    region_name=REGION,
+)
+CFG = Config(retries={"max_attempts": 3, "mode": "standard"})
+
+lam = SESSION.client("lambda", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+iam = SESSION.client("iam", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+sqs = SESSION.client("sqs", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+logs = SESSION.client("logs", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_floci(timeout: int = 60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            lam.list_functions()
+            print(f"Floci Lambda is ready at {FLOCI_ENDPOINT}")
+            return
+        except ClientError:
+            time.sleep(1)
+    raise RuntimeError("Floci did not become ready")
+
+wait_for_floci()
+```
+
+We start Floci with `-v /var/run/docker.sock:/var/run/docker.sock`, which is required because Floci launches a real Lambda runtime container to execute our code. We then build one `boto3` session and create four clients against the local endpoint: `lambda` to deploy and invoke, `iam` to create an execution role, `sqs` to drive the event trigger, and `logs` to read the function's output. The `wait_for_floci` helper polls `list_functions` until the emulator answers so the script is safe to run immediately after startup.
+
+## Creating an Execution Role and Packaging the Function
+
+```python
+banner("Create execution role + package code")
+
+ROLE_NAME = "notes-lambda-role"
+TRUST_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
+}
+
+try:
+    role_arn = iam.create_role(
+        RoleName=ROLE_NAME,
+        AssumeRolePolicyDocument=json.dumps(TRUST_POLICY),
+    )["Role"]["Arn"]
+    print("Created role:", role_arn)
+except ClientError as e:
+    if e.response["Error"]["Code"] == "EntityAlreadyExists":
+        role_arn = iam.get_role(RoleName=ROLE_NAME)["Role"]["Arn"]
+        print("Reusing role:", role_arn)
+    else:
+        raise
+
+# The handler works for both a direct invoke and an SQS event.
+HANDLER_SRC = '''
+import json
+
+def lambda_handler(event, context):
+    # SQS triggers deliver a batch under "Records"; direct invokes pass the
+    # payload straight through.
+    if isinstance(event, dict) and "Records" in event:
+        out = []
+        for rec in event["Records"]:
+            body = json.loads(rec["body"])
+            n = body.get("n", 0)
+            out.append({"n": n, "squared": n * n})
+        print("SQS batch processed:", json.dumps(out))
+        return {"processed": len(out), "results": out}
+
+    n = event.get("n", 0)
+    print("Direct invoke, n =", n)
+    return {"n": n, "squared": n * n}
+'''
+
+def build_zip(source: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("lambda_function.py", source)
+    return buf.getvalue()
+
+zip_bytes = build_zip(HANDLER_SRC)
+print(f"Packaged handler into a {len(zip_bytes)}-byte zip")
+```
+
+We create an IAM execution role whose trust policy allows the Lambda service to assume it, catching `EntityAlreadyExists` so the script is idempotent. Even though Floci does not enforce IAM permissions the way production AWS does, wiring up a real role keeps the code faithful to what you would run in the cloud. We then define a compact handler that detects whether it was called directly or by an SQS trigger (SQS delivers records under an `event["Records"]` array) and squares the input number in each case. The `build_zip` helper packages the single source file into an in-memory zip, which is exactly the deployment artifact Lambda's `ZipFile` upload expects.
+
+## Deploying the Function and Invoking It Synchronously
+
+```python
+banner("Deploy function + synchronous invoke")
+
+FUNC = "square-fn"
+
+def deploy_function():
+    try:
+        lam.create_function(
+            FunctionName=FUNC,
+            Runtime="python3.12",
+            Role=role_arn,
+            Handler="lambda_function.lambda_handler",
+            Code={"ZipFile": zip_bytes},
+            Timeout=30,
+            MemorySize=128,
+            Publish=True,
+        )
+        print("Created function:", FUNC)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceConflictException":
+            lam.update_function_code(FunctionName=FUNC, ZipFile=zip_bytes)
+            print("Updated existing function:", FUNC)
+        else:
+            raise
+    # Block until the function is ready to serve invocations.
+    lam.get_waiter("function_active_v2").wait(FunctionName=FUNC)
+
+deploy_function()
+
+# The first invoke may take a few seconds while Floci pulls the runtime image.
+resp = lam.invoke(FunctionName=FUNC, Payload=json.dumps({"n": 7}))
+result = json.loads(resp["Payload"].read())
+print("StatusCode:", resp["StatusCode"])
+print("Function result:", result)
+assert result["squared"] == 49
+print("Synchronous invoke returned the expected value")
+```
+
+We deploy the function with `create_function`, passing the zip bytes inline, the `python3.12` runtime, the role ARN, and the `lambda_function.lambda_handler` entry point. If the function already exists we fall back to `update_function_code`, then block on the `function_active_v2` waiter so we never invoke a function that is still initializing. We then call `invoke` synchronously with a JSON payload; Floci spins up a real Lambda runtime container (the first call is slower because it pulls the runtime image), runs our handler, and returns the response, which we parse from the streaming `Payload` and assert equals the expected squared value.
+
+## Adding an SQS Event Trigger with an Event Source Mapping
+
+```python
+banner("SQS event trigger")
+
+trigger_url = sqs.create_queue(QueueName="square-trigger")["QueueUrl"]
+trigger_arn = sqs.get_queue_attributes(
+    QueueUrl=trigger_url, AttributeNames=["QueueArn"]
+)["Attributes"]["QueueArn"]
+
+mapping = lam.create_event_source_mapping(
+    EventSourceArn=trigger_arn,
+    FunctionName=FUNC,
+    BatchSize=5,
+    Enabled=True,
+)
+uuid = mapping["UUID"]
+print("Created event source mapping:", uuid)
+
+# Give the mapping a moment to reach the "Enabled" state.
+for _ in range(20):
+    state = lam.get_event_source_mapping(UUID=uuid)["State"]
+    if state == "Enabled":
+        break
+    time.sleep(1)
+print("Mapping state:", state)
+
+# Send messages; the mapping polls the queue and invokes the function for us.
+for n in (2, 3, 4):
+    sqs.send_message(QueueUrl=trigger_url, MessageBody=json.dumps({"n": n}))
+print("Sent 3 messages to the trigger queue")
+
+# Confirm the trigger fired by watching the queue drain to zero.
+drained = False
+for _ in range(30):
+    visible = sqs.get_queue_attributes(
+        QueueUrl=trigger_url, AttributeNames=["ApproximateNumberOfMessages"]
+    )["Attributes"]["ApproximateNumberOfMessages"]
+    if visible == "0":
+        drained = True
+        break
+    time.sleep(1)
+print("Trigger queue drained by Lambda:", drained)
+```
+
+We attach an event trigger by creating an SQS queue and registering an event source mapping that binds the queue's ARN to our function with a `BatchSize` of five. Once the mapping reports the `Enabled` state, Floci begins polling the queue on our behalf, exactly as the real Lambda service does. We send three messages, then poll `ApproximateNumberOfMessages` until it reaches zero, which confirms the mapping picked the messages up and invoked the function to consume them, no manual receive loop required.
+
+## Reading the Function's Logs and Cleaning Up
+
+```python
+banner("Read CloudWatch logs + cleanup")
+
+log_group = f"/aws/lambda/{FUNC}"
+events = []
+for _ in range(15):
+    try:
+        events = logs.filter_log_events(logGroupName=log_group, limit=50).get("events", [])
+    except ClientError:
+        events = []
+    if events:
+        break
+    time.sleep(1)
+
+print(f"Recent log lines from {log_group}:")
+for e in events[-10:]:
+    print("  ", e["message"].rstrip())
+
+banner("Cleanup")
+lam.delete_event_source_mapping(UUID=uuid)
+lam.delete_function(FunctionName=FUNC)
+sqs.delete_queue(QueueUrl=trigger_url)
+try:
+    iam.delete_role(RoleName=ROLE_NAME)
+except ClientError:
+    pass
+print("Deleted mapping, function, queue, and role. Lambda workflow complete.")
+```
+
+We read the function's output from CloudWatch Logs, whose group name follows the standard `/aws/lambda/<function-name>` convention that Lambda creates automatically. Because logs are written asynchronously, we poll `filter_log_events` for a few seconds until entries appear, then print the most recent lines, where we can see both the direct-invoke and the SQS-batch messages our handler logged. We finish by deleting the event source mapping, the function, the trigger queue, and the IAM role, leaving no resources behind.
+
+## Conclusion
+
+In conclusion, we have a complete AWS Lambda workflow that runs locally on Floci and transfers to real AWS with a one-line endpoint change. We started a Docker-backed emulator, connected the `boto3` Lambda, IAM, SQS, and Logs clients, and exercised the operations that real serverless applications depend on: creating an execution role; packaging a handler into an in-memory zip; deploying it as a function and waiting for it to become active; invoking it synchronously and parsing the response; attaching an SQS event source mapping so messages trigger the function automatically; confirming the trigger by watching the queue drain; and reading the function's CloudWatch logs. Because Floci executes Lambda in real containers and mirrors the AWS wire protocol, every call we made here is production-accurate, which means we can develop and test entire serverless pipelines fast, offline, and for free before pointing the same code at the cloud.
+
+---
+
+*Check out the [Floci GitHub repo](https://github.com/floci-io/floci) and the [Floci docs](https://floci.io/). All the code in this tutorial runs against a local Floci container on `http://localhost:4566`, so you can copy it into a single Python file and run it end to end.*

@@ -1,0 +1,243 @@
+# Floci for Python: Build a Key-Value Notes Table on Amazon DynamoDB Locally with a GSI, Conditional Writes, Queries, Scans, and Batch Operations
+
+In this tutorial, we build a complete Amazon DynamoDB workflow that runs entirely on our own machine using **Floci**, a free, open-source, drop-in local AWS emulator that speaks the real AWS wire protocol on `http://localhost:4566`. We begin by starting a Floci container and connecting the `boto3` DynamoDB resource and client, so the exact same code runs against real AWS by swapping one endpoint. We then create a `Notes` table keyed by a simple `note_id` partition key, add a global secondary index so we can also query notes by owner, and wait for the table to become active. We write notes as key-value items with string sets and timestamps, use a conditional write to avoid clobbering an existing note, and read items back by primary key. We query the secondary index to list a single owner's notes newest-first, run atomic updates that patch fields and increment a version counter, and scan the table with a filter to find notes by tag. We bulk-load items with a batch writer, count rows, delete a note, and finally drop the table, closing the loop on a full create-read-update-delete lifecycle, all without an AWS account, an auth token, or a single cent of cloud spend.
+
+Because Floci implements the same API responses that `boto3` expects, everything you write here transfers directly to real DynamoDB by changing only the endpoint.
+
+## Starting Floci and Connecting the DynamoDB Client
+
+```bash
+# Start the local AWS emulator
+docker run -d --name floci -p 4566:4566 floci/floci:latest
+
+# Confirm it is healthy
+curl http://localhost:4566/_floci/health
+
+# Install the AWS SDK for Python
+pip install boto3
+```
+
+```python
+import os
+import time
+from decimal import Decimal
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Key, Attr
+
+FLOCI_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+SESSION = boto3.session.Session(
+    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+    region_name=REGION,
+)
+CFG = Config(retries={"max_attempts": 3, "mode": "standard"})
+
+# The resource API gives us the ergonomic Table object; the client API exposes
+# low-level calls such as waiters and list_tables.
+ddb = SESSION.resource("dynamodb", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+ddb_client = SESSION.client("dynamodb", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def wait_for_floci(timeout: int = 60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ddb_client.list_tables()
+            print(f"Floci DynamoDB is ready at {FLOCI_ENDPOINT}")
+            return
+        except ClientError:
+            time.sleep(1)
+    raise RuntimeError("Floci did not become ready")
+
+wait_for_floci()
+```
+
+We begin by launching Floci with a single `docker run` command that exposes port `4566`, then build a `boto3` session pinned to the local endpoint with `test`/`test` credentials. We create both a DynamoDB `resource` (whose `Table` object gives us the clean, Pythonic item API) and a low-level `client` (which exposes `list_tables` and waiters). The `wait_for_floci` helper polls `list_tables` until the emulator answers, so the script is safe to run the moment the container starts.
+
+## Creating the Notes Table with a Global Secondary Index
+
+```python
+TABLE = "Notes"
+
+banner("Create table + GSI")
+
+def ensure_table():
+    if TABLE in ddb_client.list_tables()["TableNames"]:
+        print(f"Table already exists: {TABLE}")
+        return ddb.Table(TABLE)
+
+    ddb_client.create_table(
+        TableName=TABLE,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "note_id", "AttributeType": "S"},
+            {"AttributeName": "owner", "AttributeType": "S"},
+            {"AttributeName": "created_at", "AttributeType": "S"},
+        ],
+        KeySchema=[{"AttributeName": "note_id", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "OwnerIndex",
+                "KeySchema": [
+                    {"AttributeName": "owner", "KeyType": "HASH"},
+                    {"AttributeName": "created_at", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    ddb_client.get_waiter("table_exists").wait(TableName=TABLE)
+    print(f"Created table: {TABLE}")
+    return ddb.Table(TABLE)
+
+table = ensure_table()
+print("Table status:", table.table_status)
+```
+
+We create the `Notes` table with a single `note_id` partition key, which is all a simple key-value store needs, and put it in on-demand (`PAY_PER_REQUEST`) billing so we never provision capacity. We also declare a global secondary index, `OwnerIndex`, keyed by `owner` (partition) and `created_at` (sort), which lets us later query every note belonging to one owner in chronological order. The three attributes referenced by the base table and the index must appear in `AttributeDefinitions`. We then block on the `table_exists` waiter so the rest of the script only runs once the table is fully active.
+
+## Writing Notes and Guarding Against Overwrites
+
+```python
+banner("Put items + conditional write")
+
+def new_note(note_id, owner, title, body, tags):
+    return {
+        "note_id": note_id,
+        "owner": owner,
+        "title": title,
+        "body": body,
+        "tags": set(tags),           # stored as a DynamoDB String Set
+        "created_at": now_iso(),
+        "version": 1,
+    }
+
+seed = [
+    new_note("n-001", "alice", "Groceries", "milk, eggs, bread", ["home", "todo"]),
+    new_note("n-002", "alice", "Standup notes", "ship the report", ["work"]),
+    new_note("n-003", "bob", "Book ideas", "a novel about queues", ["ideas", "todo"]),
+]
+for note in seed:
+    table.put_item(Item=note)
+    print(f"Put {note['note_id']} ({note['owner']})")
+
+# A conditional write refuses to overwrite an existing note_id.
+try:
+    table.put_item(
+        Item=new_note("n-001", "alice", "DUP", "should not overwrite", ["x"]),
+        ConditionExpression="attribute_not_exists(note_id)",
+    )
+    print("Wrote n-001 (unexpected)")
+except ClientError as e:
+    if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+        print("Conditional write blocked overwrite of existing n-001")
+    else:
+        raise
+```
+
+We define `new_note` to shape each item as a plain dictionary, storing `tags` as a Python `set`, which the resource API serializes to a native DynamoDB String Set. After seeding three notes with `put_item`, we demonstrate the single most important safety primitive in DynamoDB: a conditional write. By attaching `ConditionExpression="attribute_not_exists(note_id)"`, we tell DynamoDB to reject the put if that key already exists, and we catch the resulting `ConditionalCheckFailedException`, the correct pattern for implementing create-only semantics and optimistic concurrency.
+
+## Reading by Key and Querying the Secondary Index
+
+```python
+banner("Get item + query GSI")
+
+# Point read by primary key.
+item = table.get_item(Key={"note_id": "n-001"}).get("Item")
+print("get_item(n-001):")
+print("  title   :", item["title"])
+print("  tags    :", item["tags"])
+print("  version :", item["version"], "(type:", type(item["version"]).__name__, ")")
+
+# Query the GSI: all of alice's notes, newest first.
+resp = table.query(
+    IndexName="OwnerIndex",
+    KeyConditionExpression=Key("owner").eq("alice"),
+    ScanIndexForward=False,  # descending by created_at
+)
+print("\nalice's notes (newest first):")
+for n in resp["Items"]:
+    print(f"  {n['note_id']}  {n['created_at']}  {n['title']}")
+```
+
+We read a single note with `get_item`, a point lookup by primary key that is the fastest and cheapest DynamoDB operation. Note that the `version` number comes back as a `Decimal`, which is how the SDK preserves DynamoDB's exact numeric type. We then run a `query` against `OwnerIndex` using a `Key("owner").eq("alice")` condition and `ScanIndexForward=False` to return alice's notes sorted by `created_at` in descending order, the efficient, index-backed way to list one partition's items without scanning the whole table.
+
+## Updating Items Atomically and Scanning with a Filter
+
+```python
+banner("Atomic update")
+
+resp = table.update_item(
+    Key={"note_id": "n-001"},
+    UpdateExpression="SET body = :b, updated_at = :u ADD version :one",
+    ExpressionAttributeValues={
+        ":b": "milk, eggs, bread, butter",
+        ":u": now_iso(),
+        ":one": 1,
+    },
+    ReturnValues="ALL_NEW",
+)
+updated = resp["Attributes"]
+print(f"n-001 body    -> {updated['body']}")
+print(f"n-001 version -> {updated['version']}  (incremented atomically)")
+
+banner("Scan with filter + count")
+
+# Find every note tagged 'todo' anywhere in the table.
+found = table.scan(FilterExpression=Attr("tags").contains("todo"))
+print("Notes tagged 'todo':")
+for n in found["Items"]:
+    print(f"  {n['note_id']}  {n['title']}")
+
+count = table.scan(Select="COUNT")["Count"]
+print("Total notes in table:", count)
+```
+
+We update `n-001` with a single `update_item` call that both `SET`s new attributes and uses `ADD version :one` to increment the version counter atomically on the server, avoiding the read-modify-write race that a naive client-side increment would introduce. Requesting `ReturnValues="ALL_NEW"` hands back the full post-update item. We then `scan` the table with `FilterExpression=Attr("tags").contains("todo")` to find notes carrying a given tag, and issue a `Select="COUNT"` scan to get the row count. Scans read the whole table, so in production they are reserved for admin or analytics paths, while queries and point reads serve the hot path.
+
+## Bulk Loading, Deleting, and Dropping the Table
+
+```python
+banner("Batch write + delete + cleanup")
+
+# batch_writer buffers and flushes writes in batches of 25 automatically.
+with table.batch_writer() as bw:
+    for i in range(10, 13):
+        bw.put_item(Item=new_note(f"n-0{i}", "bob", f"Bulk note {i}",
+                                   "bulk-loaded", ["bulk"]))
+print("Bulk-loaded 3 notes via batch_writer")
+
+# Delete a single note.
+table.delete_item(Key={"note_id": "n-002"})
+print("Deleted n-002")
+
+print("Final count:", table.scan(Select="COUNT")["Count"])
+
+# Drop the whole table and wait until it is gone.
+ddb_client.delete_table(TableName=TABLE)
+ddb_client.get_waiter("table_not_exists").wait(TableName=TABLE)
+print(f"Deleted table: {TABLE}. Notes workflow complete.")
+```
+
+We finish by bulk-loading three more notes through `table.batch_writer()`, a context manager that automatically buffers items and flushes them in the 25-item batches DynamoDB's `BatchWriteItem` allows, transparently retrying any unprocessed items. We delete a single note with `delete_item`, re-count the table, and then drop it entirely with `delete_table`, blocking on the `table_not_exists` waiter so teardown is fully complete before the script exits.
+
+## Conclusion
+
+In conclusion, we have a complete Amazon DynamoDB key-value workflow that runs locally on Floci and transfers to real AWS with a one-line endpoint change. We started a credential-free emulator, connected the `boto3` resource and client, and exercised the operations that real applications depend on: creating an on-demand table with a global secondary index; writing items with string sets and timestamps; guarding creates with conditional writes; reading by primary key; querying an index for one owner's notes newest-first; performing atomic updates with server-side counter increments; scanning with tag filters and counting rows; bulk-loading through a batch writer; and deleting items and the table itself. Because Floci mirrors the DynamoDB wire protocol, every call we made here is production-accurate, which means we can design and test entire data models fast, offline, and for free before pointing the same code at the cloud.
+
+---
+
+*Check out the [Floci GitHub repo](https://github.com/floci-io/floci) and the [Floci docs](https://floci.io/). All the code in this tutorial runs against a local Floci container on `http://localhost:4566`, so you can copy it into a single Python file and run it end to end.*

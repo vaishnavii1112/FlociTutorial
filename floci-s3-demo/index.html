@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Floci Local Cloud Tutorials — AWS, Azure &amp; GCP with Python</title>
+<meta name="description" content="Hands-on Python tutorials for AWS, Azure, and GCP services running locally on the free, open-source Floci emulators." />
+
+<!-- Markdown rendering + syntax highlighting (CDN, GitHub Pages friendly) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #111826;
+    --panel-2: #0b1020;
+    --border: #1f2a3a;
+    --text: #e6edf3;
+    --muted: #9aa7b4;
+    --accent: #4f8cff;
+    --aws: #ff9900;
+    --azure: #2f9cf4;
+    --gcp: #34a853;
+    --code-bg: #0b1020;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .layout { display: grid; grid-template-columns: 300px 1fr; min-height: 100vh; }
+
+  /* Sidebar */
+  aside {
+    background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+    border-right: 1px solid var(--border);
+    padding: 24px 18px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; cursor: pointer; }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 9px; flex: none;
+    background: radial-gradient(circle at 30% 30%, #eaf1ff, #4f8cff 70%);
+    box-shadow: 0 3px 12px rgba(79,140,255,.4);
+  }
+  .brand h1 { font-size: 1.05rem; margin: 0; letter-spacing: .2px; }
+  .brand small { color: var(--muted); font-size: .72rem; display: block; }
+
+  .navgroup { margin-top: 20px; }
+  .navgroup h2 {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--muted); margin: 0 0 8px 6px; display: flex; align-items: center; gap: 8px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.aws { background: var(--aws); }
+  .dot.azure { background: var(--azure); }
+  .dot.gcp { background: var(--gcp); }
+
+  .navlink {
+    display: block; padding: 8px 10px; border-radius: 9px; color: var(--text);
+    font-size: .92rem; margin-bottom: 2px; border: 1px solid transparent;
+  }
+  .navlink:hover { background: rgba(255,255,255,.04); text-decoration: none; }
+  .navlink.active { background: rgba(79,140,255,.14); border-color: rgba(79,140,255,.35); }
+  .navlink .svc { font-weight: 600; }
+  .navlink .desc { color: var(--muted); font-size: .78rem; }
+
+  /* Main */
+  main { padding: 0; min-width: 0; }
+  .topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 32px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: rgba(13,17,23,.85); backdrop-filter: blur(8px); z-index: 5;
+  }
+  .topbar .crumbs { color: var(--muted); font-size: .85rem; }
+  .topbar .actions a { font-size: .85rem; margin-left: 16px; }
+
+  .content { padding: 32px 40px 80px; max-width: 900px; margin: 0 auto; }
+
+  /* Hero / landing */
+  .hero { padding: 8px 0 24px; }
+  .hero .kicker { color: var(--accent); font-weight: 600; letter-spacing: .5px; text-transform: uppercase; font-size: .78rem; }
+  .hero h1 { font-size: 2.1rem; margin: 8px 0 10px; line-height: 1.2; }
+  .hero p { color: var(--muted); font-size: 1.05rem; max-width: 720px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; margin-top: 26px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px; cursor: pointer; transition: transform .12s ease, border-color .12s ease;
+  }
+  .card:hover { transform: translateY(-3px); border-color: var(--accent); }
+  .card .tag { font-size: .68rem; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
+  .card .tag.aws { color: var(--aws); }
+  .card .tag.azure { color: var(--azure); }
+  .card .tag.gcp { color: var(--gcp); }
+  .card h3 { margin: 8px 0 6px; font-size: 1.05rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .86rem; }
+
+  /* Rendered markdown */
+  article h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  article h2 { font-size: 1.35rem; margin: 34px 0 12px; }
+  article p { color: #cbd5e1; }
+  article code { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: .88em; }
+  article :not(pre) > code {
+    background: rgba(255,255,255,.08); padding: 2px 6px; border-radius: 6px; color: #ffd9a0;
+  }
+  .codeblock { position: relative; margin: 16px 0; }
+  .codeblock pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 16px; overflow-x: auto; margin: 0;
+  }
+  .codeblock pre code { background: transparent; padding: 0; font-size: .86rem; }
+  .copybtn {
+    position: absolute; top: 8px; right: 8px; border: 1px solid var(--border);
+    background: #1a2333; color: var(--muted); border-radius: 8px; padding: 4px 10px;
+    font-size: .72rem; cursor: pointer; opacity: 0; transition: opacity .12s;
+  }
+  .codeblock:hover .copybtn { opacity: 1; }
+  .copybtn:hover { color: var(--text); border-color: var(--accent); }
+  .copybtn.done { color: var(--gcp); border-color: var(--gcp); }
+
+  .pager { display: flex; justify-content: space-between; margin-top: 48px; gap: 12px; }
+  .pager a {
+    flex: 1; border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; background: var(--panel);
+  }
+  .pager a:hover { border-color: var(--accent); text-decoration: none; }
+  .pager .lbl { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: 1px; }
+  .pager .nm { display: block; margin-top: 4px; }
+  .pager .next { text-align: right; }
+
+  .notice { background: #24170a; border: 1px solid #5a3a13; color: #ffce9e; padding: 14px 16px; border-radius: 12px; margin-top: 20px; }
+
+  footer { color: var(--muted); font-size: .82rem; border-top: 1px solid var(--border); padding: 22px 40px; text-align: center; }
+
+  .menu-toggle { display: none; }
+  @media (max-width: 860px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { position: fixed; z-index: 20; width: 280px; left: -300px; transition: left .2s; }
+    aside.open { left: 0; }
+    .menu-toggle { display: inline-block; background: none; border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+    .content { padding: 24px 18px 60px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar">
+    <div class="brand" onclick="location.hash=''">
+      <div class="logo"></div>
+      <div>
+        <h1>Floci Tutorials</h1>
+        <small>Local AWS · Azure · GCP with Python</small>
+      </div>
+    </div>
+    <nav id="nav"></nav>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <button class="menu-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰ Menu</button>
+      <div class="crumbs" id="crumbs">Home</div>
+      <div class="actions" id="actions"></div>
+    </div>
+    <div class="content" id="content"></div>
+    <footer>
+      Built with the free, open-source <a href="https://github.com/floci-io/floci" target="_blank" rel="noopener">Floci</a>
+      local cloud emulators. Tutorials render from local <code>.txt</code> files.
+    </footer>
+  </main>
+</div>
+
+<script>
+  // -------- Tutorial registry (order matters for prev/next) --------
+  const TUTORIALS = [
+    { id: "floci-s3-tutorial",              provider: "aws",   service: "Amazon S3",           blurb: "Buckets, versioning, multipart, pre-signed URLs, events, data lake." },
+    { id: "floci-aws-dynamodb-tutorial",    provider: "aws",   service: "Amazon DynamoDB",     blurb: "Key-value notes table with a GSI, queries, transactions & batches." },
+    { id: "floci-aws-sqs-tutorial",         provider: "aws",   service: "Amazon SQS",          blurb: "Send/receive, batches, FIFO, visibility timeouts, dead-letter redrive." },
+    { id: "floci-aws-lambda-tutorial",      provider: "aws",   service: "AWS Lambda",          blurb: "Zip deploy, sync invoke, and an SQS event trigger." },
+    { id: "floci-azure-blob-tutorial",      provider: "azure", service: "Azure Blob Storage",  blurb: "Upload/download files from a container, streaming & metadata." },
+    { id: "floci-azure-queue-tutorial",     provider: "azure", service: "Azure Queue Storage", blurb: "Send & process messages, visibility timeouts, producer/consumer." },
+    { id: "floci-gcp-storage-tutorial",     provider: "gcp",   service: "Cloud Storage",       blurb: "Create a bucket and manage objects, versioning & compose." },
+    { id: "floci-gcp-pubsub-tutorial",      provider: "gcp",   service: "Pub/Sub",             blurb: "Publish & subscribe with sync pull and streaming pull." },
+    { id: "floci-gcp-firestore-tutorial",   provider: "gcp",   service: "Firestore",           blurb: "A small document database: queries, transactions, aggregation." },
+    { id: "floci-gcp-secretmanager-tutorial", provider: "gcp", service: "Secret Manager",      blurb: "Store & retrieve app secrets with versions and rotation." },
+  ];
+  const PROVIDERS = {
+    aws:   { label: "Amazon Web Services", cls: "aws" },
+    azure: { label: "Microsoft Azure",     cls: "azure" },
+    gcp:   { label: "Google Cloud",        cls: "gcp" },
+  };
+
+  // -------- Build sidebar --------
+  const nav = document.getElementById("nav");
+  for (const key of Object.keys(PROVIDERS)) {
+    const group = document.createElement("div");
+    group.className = "navgroup";
+    group.innerHTML = `<h2><span class="dot ${PROVIDERS[key].cls}"></span>${PROVIDERS[key].label}</h2>`;
+    TUTORIALS.filter(t => t.provider === key).forEach(t => {
+      const a = document.createElement("a");
+      a.className = "navlink";
+      a.href = "#" + t.id;
+      a.dataset.id = t.id;
+      a.innerHTML = `<span class="svc">${t.service}</span><br><span class="desc">${t.blurb}</span>`;
+      group.appendChild(a);
+    });
+    nav.appendChild(group);
+  }
+
+  // -------- Configure marked --------
+  marked.setOptions({ gfm: true, breaks: false });
+
+  const contentEl = document.getElementById("content");
+  const crumbsEl = document.getElementById("crumbs");
+  const actionsEl = document.getElementById("actions");
+
+  function renderHome() {
+    crumbsEl.textContent = "Home";
+    actionsEl.innerHTML = "";
+    document.querySelectorAll(".navlink").forEach(n => n.classList.remove("active"));
+    let cards = "";
+    for (const key of Object.keys(PROVIDERS)) {
+      TUTORIALS.filter(t => t.provider === key).forEach(t => {
+        cards += `<div class="card" onclick="location.hash='${t.id}'">
+          <span class="tag ${t.provider}">${PROVIDERS[t.provider].label}</span>
+          <h3>${t.service}</h3>
+          <p>${t.blurb}</p>
+        </div>`;
+      });
+    }
+    contentEl.innerHTML = `
+      <div class="hero">
+        <div class="kicker">Local cloud, zero cost</div>
+        <h1>Build on AWS, Azure &amp; GCP — entirely on your machine</h1>
+        <p>Ten hands-on Python tutorials that run against the free, open-source
+        <a href="https://github.com/floci-io/floci" target="_blank" rel="noopener">Floci</a> emulators.
+        No cloud account, no auth token, no bill. Every example transfers to the real cloud by changing one endpoint.</p>
+      </div>
+      <div class="cards">${cards}</div>`;
+    window.scrollTo(0, 0);
+  }
+
+  function enhanceCodeBlocks(root) {
+    root.querySelectorAll("pre").forEach(pre => {
+      const wrap = document.createElement("div");
+      wrap.className = "codeblock";
+      pre.parentNode.insertBefore(wrap, pre);
+      wrap.appendChild(pre);
+      const code = pre.querySelector("code");
+      if (code) { try { hljs.highlightElement(code); } catch (e) {} }
+      const btn = document.createElement("button");
+      btn.className = "copybtn";
+      btn.textContent = "Copy";
+      btn.onclick = () => {
+        navigator.clipboard.writeText(code ? code.innerText : pre.innerText).then(() => {
+          btn.textContent = "Copied!"; btn.classList.add("done");
+          setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("done"); }, 1500);
+        });
+      };
+      wrap.appendChild(btn);
+    });
+  }
+
+  async function renderTutorial(id) {
+    const idx = TUTORIALS.findIndex(t => t.id === id);
+    if (idx === -1) { renderHome(); return; }
+    const t = TUTORIALS[idx];
+    document.querySelectorAll(".navlink").forEach(n => n.classList.toggle("active", n.dataset.id === id));
+    crumbsEl.textContent = `${PROVIDERS[t.provider].label} / ${t.service}`;
+    actionsEl.innerHTML = `<a href="${id}.txt" target="_blank" rel="noopener">View raw .txt</a>`;
+    contentEl.innerHTML = `<p style="color:var(--muted)">Loading…</p>`;
+
+    try {
+      const res = await fetch(`${id}.txt`, { cache: "no-cache" });
+      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      const md = await res.text();
+      const article = document.createElement("article");
+      article.innerHTML = marked.parse(md);
+      contentEl.innerHTML = "";
+      contentEl.appendChild(article);
+      enhanceCodeBlocks(article);
+
+      // prev / next pager
+      const prev = TUTORIALS[idx - 1], next = TUTORIALS[idx + 1];
+      const pager = document.createElement("div");
+      pager.className = "pager";
+      pager.innerHTML =
+        (prev ? `<a href="#${prev.id}"><span class="lbl">← Previous</span><span class="nm">${prev.service}</span></a>` : `<span></span>`) +
+        (next ? `<a class="next" href="#${next.id}"><span class="lbl">Next →</span><span class="nm">${next.service}</span></a>` : `<span></span>`);
+      contentEl.appendChild(pager);
+      window.scrollTo(0, 0);
+      document.getElementById("sidebar").classList.remove("open");
+    } catch (err) {
+      contentEl.innerHTML = `<article>
+        <h1>${t.service}</h1>
+        <div class="notice">
+          <strong>Couldn't load <code>${id}.txt</code></strong> (${err.message}).<br><br>
+          This page fetches the tutorial file next to <code>index.html</code>. If you opened this file directly
+          from disk (<code>file://</code>), browsers block that fetch. Serve it locally with
+          <code>python3 -m http.server</code> and open <code>http://localhost:8000/</code>, or push it to GitHub Pages.
+          Also make sure <code>${id}.txt</code> is committed alongside <code>index.html</code>.
+        </div>
+      </article>`;
+    }
+  }
+
+  function route() {
+    const id = location.hash.replace(/^#/, "").trim();
+    if (!id) renderHome(); else renderTutorial(id);
+  }
+  window.addEventListener("hashchange", route);
+  route();
+</script>
+</body>
+</html>

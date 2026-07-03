@@ -1,0 +1,190 @@
+# floci-gcp for Python: Publish and Subscribe to Google Cloud Pub/Sub Messages Locally with Attributes, Synchronous Pull, and Streaming Pull
+
+In this tutorial, we build a complete Google Cloud Pub/Sub workflow that runs entirely on our own machine using **floci-gcp**, a free, open-source, drop-in local Google Cloud emulator that speaks the real GCP gRPC protocol on `localhost:4588`. We begin by starting a floci-gcp container and pointing the official `google-cloud-pubsub` publisher and subscriber clients at the emulator with a single environment variable, so the exact same code runs against real GCP by removing that variable. We then create a topic and a subscription, publish messages individually and in a burst (each carrying structured attributes), and confirm delivery two ways: a synchronous `pull` that fetches a batch and acknowledges it, and a streaming `subscribe` that processes messages through a callback. We inspect acknowledgement semantics, redelivery on un-acked messages, and finally tear down the subscription and topic, closing the loop on a full publish-and-consume messaging lifecycle, all without a Google Cloud account, a service-account key, or a single cent of cloud spend.
+
+Because floci-gcp implements the same gRPC responses that the GCP client libraries expect, everything you write here transfers directly to real Pub/Sub by pointing the clients at Google instead of the emulator.
+
+## Starting floci-gcp and Connecting the Pub/Sub Clients
+
+```bash
+# Start the local GCP emulator (all services share port 4588)
+docker run -d --name floci-gcp -p 4588:4588 floci/floci-gcp:latest
+
+# Confirm it is healthy
+curl http://localhost:4588/health
+
+# Install the official Pub/Sub client
+pip install google-cloud-pubsub
+```
+
+```python
+import os
+import time
+
+# IMPORTANT: set the emulator host BEFORE importing/creating the clients.
+os.environ["PUBSUB_EMULATOR_HOST"] = "localhost:4588"
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "floci-local")
+
+from google.cloud import pubsub_v1
+from google.api_core.exceptions import AlreadyExists
+
+PROJECT = "floci-local"
+TOPIC_ID = "orders"
+SUB_ID = "orders-worker"
+
+publisher = pubsub_v1.PublisherClient()
+subscriber = pubsub_v1.SubscriberClient()
+topic_path = publisher.topic_path(PROJECT, TOPIC_ID)
+sub_path = subscriber.subscription_path(PROJECT, SUB_ID)
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_floci(timeout: int = 60):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            list(publisher.list_topics(request={"project": f"projects/{PROJECT}"}))
+            print("floci-gcp Pub/Sub is ready at", os.environ["PUBSUB_EMULATOR_HOST"])
+            return
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise RuntimeError(f"floci-gcp did not become ready: {last}")
+
+wait_for_floci()
+```
+
+We begin by launching floci-gcp with a single `docker run` command that exposes port `4588`, then set `PUBSUB_EMULATOR_HOST` before constructing the publisher and subscriber clients. Setting that variable makes the clients open an insecure gRPC channel to the emulator and skip credential validation, so no service-account key is needed. We precompute the fully-qualified `topic_path` and `subscription_path` (Pub/Sub identifies resources by `projects/<project>/topics/<id>` paths), and poll `list_topics` until the emulator answers.
+
+## Creating a Topic and a Subscription
+
+```python
+banner("Create topic + subscription")
+
+def ensure_topic():
+    try:
+        publisher.create_topic(request={"name": topic_path})
+        print("Created topic:", topic_path)
+    except AlreadyExists:
+        print("Topic already exists:", topic_path)
+
+def ensure_subscription():
+    try:
+        subscriber.create_subscription(
+            request={
+                "name": sub_path,
+                "topic": topic_path,
+                "ack_deadline_seconds": 30,
+            }
+        )
+        print("Created subscription:", sub_path)
+    except AlreadyExists:
+        print("Subscription already exists:", sub_path)
+
+ensure_topic()
+ensure_subscription()
+```
+
+We create the topic and a pull subscription with idempotent helpers that swallow `AlreadyExists`, so the script is safe to re-run. The subscription is bound to the topic and given a 30-second `ack_deadline_seconds`, which is how long a consumer has to acknowledge a delivered message before Pub/Sub considers it un-acked and redelivers it. In Pub/Sub, a subscription is the durable cursor that retains messages until they are acknowledged, so publishers and consumers stay fully decoupled.
+
+## Publishing Messages with Attributes
+
+```python
+banner("Publish messages")
+
+# Publish a single message with structured attributes (metadata).
+future = publisher.publish(
+    topic_path,
+    data=b'{"order_id": 1001, "total": 42.5}',
+    origin="checkout-service",
+    priority="high",
+)
+print("Published one message, id:", future.result())
+
+# Publish a burst; publish() returns a future per message.
+futures = []
+for i in range(1, 6):
+    payload = f'{{"order_id": {2000 + i}, "total": {i * 10}}}'.encode("utf-8")
+    futures.append(publisher.publish(topic_path, data=payload, priority="normal"))
+
+ids = [f.result() for f in futures]
+print(f"Published {len(ids)} more messages")
+```
+
+We publish messages with the `publish` method, which takes the raw `data` bytes plus any number of keyword arguments that become string **attributes** travelling alongside the payload, here `origin` and `priority`. Each `publish` call is asynchronous and returns a future; calling `.result()` blocks until the server assigns and returns the message ID. We send one message and then a burst of five, collecting all their futures, which is the idiomatic way to publish many messages efficiently while still confirming each was accepted.
+
+## Consuming with a Synchronous Pull
+
+```python
+banner("Synchronous pull + acknowledge")
+
+processed = 0
+while True:
+    resp = subscriber.pull(
+        request={"subscription": sub_path, "max_messages": 10},
+        timeout=5,
+    )
+    if not resp.received_messages:
+        break
+
+    ack_ids = []
+    for rm in resp.received_messages:
+        msg = rm.message
+        print(f"  pulled: {msg.data.decode()}  attrs={dict(msg.attributes)}")
+        ack_ids.append(rm.ack_id)
+        processed += 1
+
+    # Acknowledge the whole batch so Pub/Sub stops redelivering these messages.
+    subscriber.acknowledge(request={"subscription": sub_path, "ack_ids": ack_ids})
+
+print(f"Pulled and acknowledged {processed} messages")
+```
+
+We drain the subscription with a synchronous `pull` loop, requesting up to ten messages per call. For each `received_message` we read the payload and its attributes, and collect the `ack_id`, an opaque handle that identifies this specific delivery. After processing a batch we call `acknowledge` with all the ack IDs at once, which tells Pub/Sub the messages were handled so it stops redelivering them. An empty response ends the loop. This explicit pull/ack model gives you precise control over throughput and error handling.
+
+## Consuming with a Streaming Pull
+
+```python
+banner("Streaming pull with a callback")
+
+# Publish two more messages to consume via the streaming API.
+for i in range(1, 3):
+    publisher.publish(topic_path, data=f"stream-msg-{i}".encode("utf-8")).result()
+
+received = []
+
+def callback(message):
+    received.append(message.data.decode())
+    print("  streamed:", message.data.decode())
+    message.ack()  # acknowledge from inside the callback
+
+streaming_future = subscriber.subscribe(sub_path, callback=callback)
+try:
+    # Let the background stream run briefly, then stop it.
+    streaming_future.result(timeout=6)
+except Exception:
+    streaming_future.cancel()
+    streaming_future.result()
+
+print("Streaming received:", received)
+
+banner("Cleanup")
+subscriber.delete_subscription(request={"subscription": sub_path})
+publisher.delete_topic(request={"topic": topic_path})
+subscriber.close()
+print("Deleted subscription and topic. Pub/Sub workflow complete.")
+```
+
+We finish with the streaming consumer, which is how most production services consume Pub/Sub. We publish two more messages, then call `subscribe`, which opens a background streaming-pull connection and invokes our `callback` for each delivered message; the callback acknowledges the message with `message.ack()`. Because `subscribe` runs asynchronously, we let it run for a few seconds via `result(timeout=...)` and then cancel it cleanly. We then delete the subscription and topic and close the subscriber, leaving no resources behind.
+
+## Conclusion
+
+In conclusion, we have a complete Google Cloud Pub/Sub workflow that runs locally on floci-gcp and transfers to real GCP by simply not pointing at the emulator. We started a credential-free emulator, connected the official `google-cloud-pubsub` clients with one environment variable, and exercised the operations that real messaging systems depend on: creating topics and subscriptions; publishing messages with structured attributes both singly and in bursts; consuming with a synchronous pull and batched acknowledgement; consuming with a streaming-pull callback; and tearing everything down cleanly. Because floci-gcp mirrors the Pub/Sub gRPC protocol, every call we made here is production-accurate, which means we can build and test entire event-driven pipelines fast, offline, and for free before running the same code against the cloud.
+
+---
+
+*Check out the [floci-gcp GitHub repo](https://github.com/floci-io/floci-gcp) and the [floci-gcp docs](https://floci.io/floci-gcp/). All the code in this tutorial runs against a local floci-gcp container on `http://localhost:4588`, so you can copy it into a single Python file and run it end to end.*

@@ -1,0 +1,265 @@
+# Floci for Python: Send and Receive Amazon SQS Messages Locally with Batches, Long Polling, Visibility Timeouts, FIFO Queues, and Dead-Letter Redrive
+
+In this tutorial, we build a complete Amazon SQS workflow that runs entirely on our own machine using **Floci**, a free, open-source, drop-in local AWS emulator that speaks the real AWS wire protocol on `http://localhost:4566`. We begin by starting a Floci container and connecting the `boto3` SQS client, so the exact same code runs against real AWS by swapping one endpoint. We then create a standard queue and send messages both individually (with typed message attributes) and in batches. We receive messages using long polling, process them, and delete them to acknowledge completion, and we inspect the queue's approximate depth and in-flight counts. We adjust a message's visibility timeout on the fly to release or extend a lease, create a FIFO queue that preserves ordering and deduplicates by content, and wire up a dead-letter queue so that messages which fail repeatedly are automatically redriven out of the main queue. Finally, we clean up every queue we created, closing the loop on a full send-and-receive messaging lifecycle, all without an AWS account, an auth token, or a single cent of cloud spend.
+
+Because Floci implements the same API responses that `boto3` expects, everything you write here transfers directly to real SQS by changing only the endpoint.
+
+## Starting Floci and Connecting the SQS Client
+
+```bash
+# Start the local AWS emulator
+docker run -d --name floci -p 4566:4566 floci/floci:latest
+
+# Confirm it is healthy
+curl http://localhost:4566/_floci/health
+
+# Install the AWS SDK for Python
+pip install boto3
+```
+
+```python
+import os
+import json
+import time
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+FLOCI_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+SESSION = boto3.session.Session(
+    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+    region_name=REGION,
+)
+CFG = Config(retries={"max_attempts": 3, "mode": "standard"})
+
+sqs = SESSION.client("sqs", endpoint_url=FLOCI_ENDPOINT, config=CFG)
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_floci(timeout: int = 60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            sqs.list_queues()
+            print(f"Floci SQS is ready at {FLOCI_ENDPOINT}")
+            return
+        except ClientError:
+            time.sleep(1)
+    raise RuntimeError("Floci did not become ready")
+
+wait_for_floci()
+```
+
+We begin by launching Floci with a single `docker run` command that exposes port `4566`, then build a `boto3` SQS client pinned to the local endpoint with `test`/`test` credentials. The `wait_for_floci` helper polls `list_queues` until the emulator answers, so the script is safe to run the moment the container starts. Every subsequent call in this tutorial goes through this one client.
+
+## Creating a Queue and Sending Messages
+
+```python
+banner("Create queue + send messages")
+
+QUEUE = "tasks"
+queue_url = sqs.create_queue(
+    QueueName=QUEUE,
+    Attributes={"VisibilityTimeout": "30", "MessageRetentionPeriod": "3600"},
+)["QueueUrl"]
+print("Queue URL:", queue_url)
+
+# 1) Send a single message with typed message attributes (metadata, not body).
+sqs.send_message(
+    QueueUrl=queue_url,
+    MessageBody=json.dumps({"task": "resize-image", "file": "cat.png"}),
+    MessageAttributes={
+        "priority": {"DataType": "String", "StringValue": "high"},
+        "retries": {"DataType": "Number", "StringValue": "0"},
+    },
+)
+print("Sent 1 message with attributes")
+
+# 2) Send a batch of messages in a single request (up to 10 entries).
+entries = [
+    {"Id": str(i), "MessageBody": json.dumps({"task": f"job-{i}", "n": i})}
+    for i in range(1, 6)
+]
+resp = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
+print(f"Batch sent: {len(resp.get('Successful', []))} ok, "
+      f"{len(resp.get('Failed', []))} failed")
+```
+
+We create a standard queue with a 30-second default visibility timeout and a one-hour retention period. We then send messages two ways. First, a single `send_message` carries a JSON body plus typed `MessageAttributes` (`priority` and `retries`), which travel alongside the payload as structured metadata that consumers can read without parsing the body. Second, `send_message_batch` posts up to ten messages in one request, each identified by a batch-local `Id`, and returns per-entry `Successful` and `Failed` lists, the efficient way to enqueue many messages while minimizing round trips.
+
+## Receiving, Processing, and Deleting with Long Polling
+
+```python
+banner("Receive + process + delete (long polling)")
+
+processed = 0
+while True:
+    resp = sqs.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=10,      # pull up to 10 at once
+        WaitTimeSeconds=5,           # long poll: wait up to 5s for messages
+        VisibilityTimeout=30,
+        MessageAttributeNames=["All"],
+        AttributeNames=["ApproximateReceiveCount"],
+    )
+    messages = resp.get("Messages", [])
+    if not messages:
+        break
+
+    # Acknowledge each processed message in a single batched delete.
+    delete_entries = []
+    for m in messages:
+        body = json.loads(m["Body"])
+        recv_count = m["Attributes"]["ApproximateReceiveCount"]
+        print(f"  processing {body}  (receive #{recv_count})")
+        delete_entries.append({"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]})
+        processed += 1
+
+    sqs.delete_message_batch(QueueUrl=queue_url, Entries=delete_entries)
+
+print(f"Processed and deleted {processed} messages")
+```
+
+We drain the queue with a long-polling receive loop. Setting `WaitTimeSeconds=5` turns on long polling, so `receive_message` waits for messages to arrive instead of returning immediately with an empty response, which cuts both latency and empty-receive cost. We pull up to ten messages per call, read each one's body and its `ApproximateReceiveCount` (how many times it has been delivered), and then acknowledge the whole batch at once with `delete_message_batch`. Deleting is what actually removes a message from SQS; until you delete it, the message only becomes invisible for the visibility timeout and will reappear if not acknowledged in time.
+
+## Managing Visibility Timeouts and Inspecting Queue Depth
+
+```python
+banner("Visibility timeout + queue attributes")
+
+# Send one message, receive it, then hand it back early by zeroing visibility.
+sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({"task": "requeue-me"}))
+
+resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=5)
+msg = resp["Messages"][0]
+print("Received, now releasing it back for immediate redelivery")
+
+# Return the message to the queue right away by setting visibility to 0.
+sqs.change_message_visibility(
+    QueueUrl=queue_url,
+    ReceiptHandle=msg["ReceiptHandle"],
+    VisibilityTimeout=0,
+)
+
+# Read the depth counters straight from the queue attributes.
+attrs = sqs.get_queue_attributes(
+    QueueUrl=queue_url,
+    AttributeNames=[
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+    ],
+)["Attributes"]
+print("Visible messages    :", attrs["ApproximateNumberOfMessages"])
+print("In-flight (invisible):", attrs["ApproximateNumberOfMessagesNotVisible"])
+
+# Clean up: receive and delete the released message.
+resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=5)
+for m in resp.get("Messages", []):
+    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=m["ReceiptHandle"])
+print("Drained the requeued message")
+```
+
+We show how consumers control a message's lease. After receiving a message, calling `change_message_visibility` with `VisibilityTimeout=0` hands it straight back to the queue for immediate redelivery, which is exactly what you do when a worker decides it cannot process a message and wants another consumer to pick it up quickly. We then read `ApproximateNumberOfMessages` and `ApproximateNumberOfMessagesNotVisible` from `get_queue_attributes` to see, respectively, how many messages are available and how many are currently in flight, the two counters you monitor to gauge backlog and consumer health.
+
+## Creating a FIFO Queue for Ordered, Deduplicated Delivery
+
+```python
+banner("FIFO queue")
+
+fifo_url = sqs.create_queue(
+    QueueName="orders.fifo",  # FIFO queue names must end in .fifo
+    Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+)["QueueUrl"]
+
+# All messages in one MessageGroupId are delivered in strict order.
+for i in range(1, 4):
+    sqs.send_message(
+        QueueUrl=fifo_url,
+        MessageBody=json.dumps({"order": i}),
+        MessageGroupId="customer-42",
+    )
+
+# Send a duplicate body: content-based dedup drops it silently.
+sqs.send_message(
+    QueueUrl=fifo_url,
+    MessageBody=json.dumps({"order": 3}),
+    MessageGroupId="customer-42",
+)
+
+received = []
+while len(received) < 5:
+    resp = sqs.receive_message(QueueUrl=fifo_url, MaxNumberOfMessages=10, WaitTimeSeconds=3)
+    batch = resp.get("Messages", [])
+    if not batch:
+        break
+    for m in batch:
+        received.append(json.loads(m["Body"])["order"])
+        sqs.delete_message(QueueUrl=fifo_url, ReceiptHandle=m["ReceiptHandle"])
+
+print("FIFO delivery order:", received, "(duplicate order=3 was deduped)")
+```
+
+We create a FIFO queue, whose name must end in `.fifo`, with `ContentBasedDeduplication` enabled. Every message tagged with the same `MessageGroupId` is delivered in strict first-in-first-out order, which standard queues do not guarantee. Because content-based deduplication is on, re-sending an identical body within the dedup window is silently discarded, so the fourth send (a duplicate `order=3`) never reaches consumers. Receiving the messages back confirms both properties: the orders arrive in sequence, and the duplicate is absent.
+
+## Wiring a Dead-Letter Queue with Redrive
+
+```python
+banner("Dead-letter queue + redrive")
+
+# 1) Create the dead-letter queue and read its ARN.
+dlq_url = sqs.create_queue(QueueName="tasks-dlq")["QueueUrl"]
+dlq_arn = sqs.get_queue_attributes(
+    QueueUrl=dlq_url, AttributeNames=["QueueArn"]
+)["Attributes"]["QueueArn"]
+
+# 2) Create the main queue with a redrive policy pointing at the DLQ.
+main_url = sqs.create_queue(
+    QueueName="tasks-main",
+    Attributes={
+        "VisibilityTimeout": "0",  # 0 so we can re-receive immediately in this demo
+        "RedrivePolicy": json.dumps(
+            {"deadLetterTargetArn": dlq_arn, "maxReceiveCount": 2}
+        ),
+    },
+)["QueueUrl"]
+
+# 3) Send a "poison" message and receive it more than maxReceiveCount times
+#    WITHOUT deleting it, so SQS redrives it to the DLQ.
+sqs.send_message(QueueUrl=main_url, MessageBody=json.dumps({"task": "poison"}))
+for attempt in range(1, 4):
+    resp = sqs.receive_message(QueueUrl=main_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+    got = resp.get("Messages", [])
+    print(f"  main receive attempt {attempt}: {'message' if got else 'empty'}")
+    time.sleep(1)
+
+# 4) The poison message should now be sitting in the DLQ.
+resp = sqs.receive_message(QueueUrl=dlq_url, MaxNumberOfMessages=1, WaitTimeSeconds=5)
+dead = resp.get("Messages", [])
+print("Messages redriven to DLQ:", len(dead))
+for m in dead:
+    print("  DLQ body:", m["Body"])
+    sqs.delete_message(QueueUrl=dlq_url, ReceiptHandle=m["ReceiptHandle"])
+
+banner("Cleanup")
+for url in (queue_url, fifo_url, main_url, dlq_url):
+    sqs.delete_queue(QueueUrl=url)
+    print("Deleted", url.rsplit("/", 1)[-1])
+print("SQS workflow complete.")
+```
+
+We finish with the resilience pattern every production queue needs. We create a dead-letter queue, read its ARN, and attach a `RedrivePolicy` with `maxReceiveCount: 2` to a new main queue. We then enqueue a "poison" message and deliberately receive it repeatedly without deleting it; once its receive count exceeds the threshold, SQS automatically moves it to the dead-letter queue instead of redelivering it forever. Reading from the DLQ confirms the message landed there, giving you a place to inspect and replay failures. We then delete all four queues we created so the teardown is clean.
+
+## Conclusion
+
+In conclusion, we have a complete Amazon SQS messaging workflow that runs locally on Floci and transfers to real AWS with a one-line endpoint change. We started a credential-free emulator, connected the `boto3` SQS client, and exercised the operations that real systems depend on: creating standard and FIFO queues; sending messages with typed attributes and in batches; receiving with long polling and acknowledging with batched deletes; adjusting visibility timeouts and reading backlog and in-flight counters; guaranteeing ordering and deduplication with a FIFO queue and message groups; and configuring dead-letter redrive so poison messages are quarantined after repeated failures. Because Floci mirrors the SQS wire protocol, every call we made here is production-accurate, which means we can build and test entire event-driven pipelines fast, offline, and for free before pointing the same code at the cloud.
+
+---
+
+*Check out the [Floci GitHub repo](https://github.com/floci-io/floci) and the [Floci docs](https://floci.io/). All the code in this tutorial runs against a local Floci container on `http://localhost:4566`, so you can copy it into a single Python file and run it end to end.*

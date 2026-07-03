@@ -1,0 +1,194 @@
+# floci-gcp for Python: Build a Small Document Database on Google Cloud Firestore Locally with Collections, Queries, Transactions, and Aggregation
+
+In this tutorial, we build a complete Google Cloud Firestore workflow that runs entirely on our own machine using **floci-gcp**, a free, open-source, drop-in local Google Cloud emulator that speaks the real GCP gRPC protocol on `localhost:4588`. We begin by starting a floci-gcp container and pointing the official `google-cloud-firestore` client at the emulator with a single environment variable, so the exact same code runs against real GCP by removing that variable. We then model a small document database: we write user documents with explicit IDs and with auto-generated IDs, read documents back by reference, and list a collection. We run queries with field filters, ordering, and limits, apply atomic field transforms such as increments and array unions, and run a transaction that reads-then-writes consistently. We use a batched write to mutate several documents in one commit, count documents with a server-side aggregation query, and finally delete documents to clean up, closing the loop on a full document-database lifecycle, all without a Google Cloud account, a service-account key, or a single cent of cloud spend.
+
+Because floci-gcp implements the same gRPC responses that the GCP client libraries expect, everything you write here transfers directly to real Firestore by pointing the client at Google instead of the emulator.
+
+## Starting floci-gcp and Connecting the Firestore Client
+
+```bash
+# Start the local GCP emulator (all services share port 4588)
+docker run -d --name floci-gcp -p 4588:4588 floci/floci-gcp:latest
+
+# Confirm it is healthy
+curl http://localhost:4588/health
+
+# Install the official Firestore client
+pip install google-cloud-firestore
+```
+
+```python
+import os
+import time
+
+# IMPORTANT: set the emulator host BEFORE importing/creating the client.
+os.environ["FIRESTORE_EMULATOR_HOST"] = "localhost:4588"
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "floci-local")
+
+from google.cloud import firestore
+
+PROJECT = "floci-local"
+COLLECTION = "users"
+
+db = firestore.Client(project=PROJECT)
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_floci(timeout: int = 60):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            list(db.collections())
+            print("floci-gcp Firestore is ready at", os.environ["FIRESTORE_EMULATOR_HOST"])
+            return
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise RuntimeError(f"floci-gcp did not become ready: {last}")
+
+wait_for_floci()
+```
+
+We begin by launching floci-gcp with a single `docker run` command that exposes port `4588`, then set `FIRESTORE_EMULATOR_HOST` before creating the `google-cloud-firestore` client. Setting that variable makes the client connect to the emulator over an insecure gRPC channel and skip credential validation, so `firestore.Client(project="floci-local")` needs no service-account key. The `wait_for_floci` helper lists collections until the emulator answers so the script is safe to run immediately after startup.
+
+## Writing Documents with Explicit and Auto-Generated IDs
+
+```python
+banner("Write documents")
+
+users = db.collection(COLLECTION)
+
+# set() with a known document ID (creates or fully replaces).
+users.document("alice").set({
+    "name": "Alice",
+    "age": 30,
+    "city": "Berlin",
+    "tags": ["admin"],
+    "logins": 0,
+    "active": True,
+})
+users.document("bob").set({
+    "name": "Bob",
+    "age": 25,
+    "city": "Berlin",
+    "tags": ["member"],
+    "logins": 0,
+    "active": True,
+})
+print("Wrote alice and bob with explicit IDs")
+
+# add() lets Firestore generate the document ID for you.
+_, carol_ref = users.add({
+    "name": "Carol",
+    "age": 41,
+    "city": "Lisbon",
+    "tags": ["member"],
+    "logins": 0,
+    "active": True,
+})
+print("Added Carol with auto-ID:", carol_ref.id)
+```
+
+We model a `users` collection and write documents two ways. Using `document("alice").set({...})` creates a document with an ID we choose, replacing it entirely if it already exists. Using `collection.add({...})` lets Firestore mint a random document ID and returns a reference to the new document, which is the idiomatic pattern when the document has no natural key. Each document is a schemaless map of fields, including scalars, booleans, and arrays.
+
+## Reading Documents and Running Queries
+
+```python
+banner("Read + query")
+
+# Point read by document reference.
+snap = users.document("alice").get()
+print("alice ->", snap.to_dict() if snap.exists else "MISSING")
+
+# List every document in the collection.
+print("\nAll users:")
+for doc in users.stream():
+    d = doc.to_dict()
+    print(f"  {doc.id:8s} {d['name']:6s} age={d['age']} city={d['city']}")
+
+# Query: users in Berlin, age >= 26, ordered by age.
+q = (
+    users
+    .where(filter=firestore.FieldFilter("city", "==", "Berlin"))
+    .where(filter=firestore.FieldFilter("age", ">=", 26))
+    .order_by("age")
+    .limit(10)
+)
+print("\nBerlin users age>=26 (by age):")
+for doc in q.stream():
+    d = doc.to_dict()
+    print(f"  {d['name']}  age={d['age']}")
+```
+
+We read a single document with `document("alice").get()`, checking `snap.exists` before calling `to_dict()`. We list the whole collection by iterating `users.stream()`, which returns every document snapshot. We then build a compound query using `where(filter=firestore.FieldFilter(...))` clauses combined with `order_by` and `limit`, retrieving Berlin users aged 26 or older, sorted by age. The `FieldFilter` object is the current, non-deprecated way to express query predicates in the Firestore client.
+
+## Atomic Transforms, Transactions, and Batched Writes
+
+```python
+banner("Transforms + transaction + batch")
+
+# Atomic field transforms: increment a counter and union into an array.
+users.document("alice").update({
+    "logins": firestore.Increment(1),
+    "tags": firestore.ArrayUnion(["vip"]),
+    "last_seen": firestore.SERVER_TIMESTAMP,
+})
+print("alice after transform:", users.document("alice").get().to_dict()["tags"])
+
+# A transaction reads then writes atomically (no lost updates under contention).
+@firestore.transactional
+def promote(transaction, ref):
+    snapshot = ref.get(transaction=transaction)
+    age = snapshot.get("age")
+    transaction.update(ref, {"age": age + 1, "logins": firestore.Increment(1)})
+
+promote(db.transaction(), users.document("bob"))
+print("bob after transaction:", users.document("bob").get().to_dict()["age"])
+
+# Batched write: multiple mutations committed together.
+batch = db.batch()
+batch.update(users.document("alice"), {"active": False})
+batch.set(users.document("dave"), {"name": "Dave", "age": 38, "city": "Lisbon",
+                                    "tags": ["member"], "logins": 0, "active": True})
+batch.commit()
+print("Committed a batch (deactivated alice, added dave)")
+```
+
+We apply server-side field transforms with `update`: `firestore.Increment(1)` atomically bumps the `logins` counter, `firestore.ArrayUnion` adds a tag without duplicating it, and `firestore.SERVER_TIMESTAMP` stamps the server's time. We then run a `@firestore.transactional` function that reads a document and writes back based on its current value inside one atomic transaction, the correct way to avoid lost updates under concurrency. Finally, we use `db.batch()` to group several writes and commit them together, so they all apply or none do.
+
+## Aggregation and Cleanup
+
+```python
+banner("Aggregation count + cleanup")
+
+# Server-side COUNT aggregation over a query.
+count_query = users.count()
+result = count_query.get()
+total = result[0][0].value
+print("Total users:", total)
+
+# Count only active users.
+active_count = users.where(filter=firestore.FieldFilter("active", "==", True)).count().get()
+print("Active users:", active_count[0][0].value)
+
+# Delete documents to clean up (Firestore has no "drop collection" server-side).
+deleted = 0
+for doc in users.stream():
+    doc.reference.delete()
+    deleted += 1
+print(f"Deleted {deleted} documents. Firestore workflow complete.")
+```
+
+We finish with a server-side aggregation: `users.count().get()` runs a `COUNT` aggregation on the server and returns the total without streaming every document to the client, and we run it again with a filter to count only active users. The result is nested as `result[0][0].value`, the shape the aggregation API returns. Because Firestore has no server-side "drop collection" operation, we clean up by streaming the collection and deleting each document reference, which is the standard teardown pattern.
+
+## Conclusion
+
+In conclusion, we have a complete Google Cloud Firestore document-database workflow that runs locally on floci-gcp and transfers to real GCP by simply not pointing at the emulator. We started a credential-free emulator, connected the official `google-cloud-firestore` client with one environment variable, and exercised the operations that real applications depend on: writing documents with explicit and auto-generated IDs; reading by reference and listing collections; running compound queries with field filters, ordering, and limits; applying atomic increments, array unions, and server timestamps; running a read-then-write transaction; committing batched writes; counting with server-side aggregation; and deleting documents. Because floci-gcp mirrors the Firestore gRPC protocol, every call we made here is production-accurate, which means we can design and test entire data models fast, offline, and for free before running the same code against the cloud.
+
+---
+
+*Check out the [floci-gcp GitHub repo](https://github.com/floci-io/floci-gcp) and the [floci-gcp docs](https://floci.io/floci-gcp/). All the code in this tutorial runs against a local floci-gcp container on `http://localhost:4588`, so you can copy it into a single Python file and run it end to end.*

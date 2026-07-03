@@ -1,0 +1,210 @@
+# floci-az for Python: Upload and Download Files from Azure Blob Storage Locally with Containers, Metadata, Streaming, and Listing
+
+In this tutorial, we build a complete Azure Blob Storage workflow that runs entirely on our own machine using **floci-az**, a free, open-source, drop-in local Azure emulator that speaks the real Azure Storage REST protocol on `http://localhost:4577`. We begin by starting a floci-az container and connecting the official `azure-storage-blob` Python SDK with the standard development connection string, so the exact same code runs against real Azure by swapping one endpoint. We then create a blob container, upload text and binary files with content types and custom metadata, and overwrite an existing blob to prove idempotent uploads. We download blobs back into memory and stream large blobs directly to disk in chunks without loading them fully into RAM. We list the contents of a container, filter by prefix to walk a virtual folder hierarchy, and read per-blob properties such as size, content type, and metadata. Finally, we clean up individual blobs and the container itself, closing the loop on a full upload-download-manage lifecycle, all without an Azure subscription, an auth token, or a single cent of cloud spend.
+
+Because floci-az implements the same REST responses that the Azure SDKs and the Azure CLI expect, everything you write here transfers directly to Azure Blob Storage by changing only the connection string.
+
+## Starting floci-az and Connecting the Blob Service Client
+
+```bash
+# Start the local Azure emulator (Blob, Queue, and Table on a single port)
+docker run -d --name floci-az \
+  -p 4577:4577 \
+  -e FLOCI_AZ_SERVICES_FUNCTIONS_ENABLED=false \
+  floci/floci-az:latest
+
+# Confirm it is healthy
+curl http://localhost:4577/health
+
+# Install the official Azure Blob SDK
+pip install azure-storage-blob
+```
+
+```python
+import io
+import os
+import time
+from azure.storage.blob import (
+    BlobServiceClient,
+    ContentSettings,
+    StandardBlobTier,
+)
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+
+# The standard Azurite-compatible development connection string.
+# floci-az runs in "dev" auth mode, so the account name/key are accepted as-is.
+CONNECTION_STRING = (
+    "DefaultEndpointsProtocol=http;"
+    "AccountName=devstoreaccount1;"
+    "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
+    "K1SZFPTOtr/KBHBeksoGMh0==;"
+    "BlobEndpoint=http://localhost:4577/devstoreaccount1;"
+)
+
+CONTAINER = "reports"
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_blob(service: BlobServiceClient, timeout: int = 60):
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            list(service.list_containers())
+            print("floci-az Blob endpoint is ready")
+            return
+        except Exception as e:  # emulator still booting
+            last_err = e
+            time.sleep(1)
+    raise RuntimeError(f"floci-az did not become ready: {last_err}")
+
+service = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+wait_for_blob(service)
+```
+
+We begin by launching floci-az with a single `docker run` command that exposes port `4577` for all storage services, disabling the Azure Functions runtime since this tutorial only needs Blob storage. We then build a `BlobServiceClient` from the standard development connection string, which points the SDK's `BlobEndpoint` at the local emulator using path-style addressing (`http://localhost:4577/devstoreaccount1`). The `wait_for_blob` helper polls `list_containers` until the emulator answers, making the script safe to run immediately after the container starts.
+
+## Creating a Container and Uploading Text and Binary Files
+
+```python
+banner("Create container + upload blobs")
+
+def ensure_container(name: str):
+    try:
+        service.create_container(name)
+        print(f"Created container: {name}")
+    except ResourceExistsError:
+        print(f"Container already exists: {name}")
+    return service.get_container_client(name)
+
+container = ensure_container(CONTAINER)
+
+# 1) Upload text with an explicit content type and custom metadata.
+text_blob = container.get_blob_client("notes/readme.txt")
+text_blob.upload_blob(
+    b"floci-az serves the real Azure Blob API locally.\nNo cloud account needed.\n",
+    overwrite=True,
+    content_settings=ContentSettings(content_type="text/plain"),
+    metadata={"author": "tutorial", "stage": "draft"},
+)
+print("Uploaded notes/readme.txt")
+
+# 2) Create a real local file, then upload it as a binary blob.
+local_path = "sample-data.csv"
+with open(local_path, "w", encoding="utf-8") as f:
+    f.write("id,category,amount\n")
+    for i in range(1, 6):
+        f.write(f"{i},cat-{i % 3},{i * 12.5}\n")
+
+with open(local_path, "rb") as data:
+    container.upload_blob(
+        name="datasets/sample-data.csv",
+        data=data,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="text/csv"),
+    )
+print("Uploaded datasets/sample-data.csv from a local file")
+
+# 3) Overwrite the text blob to prove uploads are idempotent when overwrite=True.
+text_blob.upload_blob(
+    b"Second revision of the readme, uploaded over the first.\n",
+    overwrite=True,
+    content_settings=ContentSettings(content_type="text/plain"),
+    metadata={"author": "tutorial", "stage": "reviewed"},
+)
+print("Overwrote notes/readme.txt with a new revision")
+```
+
+We create the target container with an idempotent `ensure_container` helper that swallows `ResourceExistsError`, so the script can be re-run safely. We then upload three blobs that cover the common cases: a text blob created directly from an in-memory `bytes` object with an explicit `text/plain` content type and custom metadata; a binary blob streamed from a real local CSV file we generate on disk; and an overwrite of the first blob using `overwrite=True`, which demonstrates how Azure replaces blob content and metadata atomically in a single request.
+
+## Downloading Blobs into Memory and Streaming Large Blobs to Disk
+
+```python
+banner("Download blobs")
+
+# Download a small blob fully into memory.
+downloaded = container.get_blob_client("notes/readme.txt").download_blob()
+print("In-memory download of notes/readme.txt:")
+print(" ", downloaded.readall().decode("utf-8").strip())
+
+# Stream a blob to a local file in chunks, never loading it all into RAM.
+out_path = "downloaded-sample-data.csv"
+with open(out_path, "wb") as f:
+    stream = container.get_blob_client("datasets/sample-data.csv").download_blob()
+    stream.readinto(f)  # writes directly into the file object in chunks
+print(f"Streamed datasets/sample-data.csv -> {out_path} "
+      f"({os.path.getsize(out_path)} bytes)")
+
+# Partial (ranged) download: read only the first 16 bytes of a blob.
+head = container.get_blob_client("datasets/sample-data.csv").download_blob(
+    offset=0, length=16
+)
+print("First 16 bytes:", head.readall())
+```
+
+We download blobs three ways, mirroring how production code handles different payload sizes. First, we pull the small readme fully into memory with `download_blob().readall()`. Second, we stream the CSV directly into a local file with `readinto`, which writes the blob in chunks so that arbitrarily large files never need to fit in memory at once. Third, we issue a ranged download by passing `offset` and `length`, retrieving just the first sixteen bytes, the same technique used to peek at file headers or resume interrupted transfers.
+
+## Listing Container Contents and Reading Blob Properties
+
+```python
+banner("List blobs and read properties")
+
+# List every blob in the container.
+print("All blobs:")
+for blob in container.list_blobs():
+    print(f"  {blob.name:32s} {blob.size:>6} bytes  {blob.last_modified}")
+
+# List only blobs under a virtual 'folder' by filtering on a name prefix.
+print("\nBlobs under 'datasets/':")
+for blob in container.list_blobs(name_starts_with="datasets/"):
+    print(f"  {blob.name}")
+
+# Read detailed properties and custom metadata for a single blob.
+props = container.get_blob_client("notes/readme.txt").get_blob_properties()
+print("\nProperties of notes/readme.txt:")
+print("  size          :", props.size)
+print("  content_type  :", props.content_settings.content_type)
+print("  etag          :", props.etag)
+print("  metadata      :", props.metadata)
+```
+
+We enumerate the container with `list_blobs`, which returns lightweight metadata (name, size, last-modified) without downloading any content. Because Azure Blob storage is flat, "folders" are just name prefixes, so passing `name_starts_with="datasets/"` walks a virtual directory and returns only the blobs beneath it. We then fetch the full property set for a single blob with `get_blob_properties`, reading back its size, content type, ETag, and the custom metadata we attached earlier, confirming that floci-az preserves blob state exactly like Azure.
+
+## Cleaning Up Blobs and the Container
+
+```python
+banner("Delete blobs and container")
+
+# Delete a single blob.
+container.delete_blob("notes/readme.txt")
+print("Deleted notes/readme.txt")
+
+remaining = [b.name for b in container.list_blobs()]
+print("Remaining blobs:", remaining)
+
+# Delete the whole container (and everything in it) idempotently.
+try:
+    service.delete_container(CONTAINER)
+    print(f"Deleted container: {CONTAINER}")
+except ResourceNotFoundError:
+    print(f"Container already gone: {CONTAINER}")
+
+# Tidy the local files we created.
+for path in ("sample-data.csv", "downloaded-sample-data.csv"):
+    if os.path.exists(path):
+        os.remove(path)
+print("Local scratch files removed. Blob workflow complete.")
+```
+
+We finish by exercising the deletion path. We remove a single blob with `delete_blob` and re-list the container to confirm the object is gone, then delete the entire container with `delete_container`, wrapped in a `ResourceNotFoundError` guard so the cleanup is idempotent. We also remove the temporary local files we generated, leaving the workspace exactly as we found it.
+
+## Conclusion
+
+In conclusion, we have a complete Azure Blob Storage workflow that runs locally on floci-az and transfers to real Azure with a one-line connection-string change. We started a credential-free emulator, connected the official `azure-storage-blob` SDK, and exercised the operations that real applications depend on: creating containers; uploading text and binary files with content types and metadata; overwriting blobs idempotently; downloading into memory, streaming to disk, and reading byte ranges; listing containers with prefix-based virtual folders; reading blob properties and metadata; and cleaning up blobs and containers. Because floci-az mirrors the Azure Storage wire protocol, every call we made here is production-accurate, which means we can build and test entire Blob storage pipelines fast, offline, and for free before pointing the same code at the cloud.
+
+---
+
+*Check out the [floci-az GitHub repo](https://github.com/floci-io/floci-az) and the [floci-az docs](https://floci.io/floci-az/). All the code in this tutorial runs against a local floci-az container on `http://localhost:4577`, so you can copy it into a single Python file and run it end to end.*

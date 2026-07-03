@@ -1,0 +1,417 @@
+# Floci for Python: Build a Complete Local Amazon S3 Workflow with Versioning, Multipart Uploads, Pre-Signed URLs, Event Notifications, and an S3-Backed Data Lake
+
+In this tutorial, we build a full Amazon S3 workflow that runs entirely on our own machine using **Floci**, a free, open-source, drop-in local AWS emulator that speaks the real AWS wire protocol on `http://localhost:4566`. We begin by starting a Floci container, wiring up a `boto3` S3 client with path-style addressing, and adding small helper functions so the rest of the workflow stays readable. We then create buckets, enable versioning, and upload objects with metadata, tags, and server-side encryption. Using S3's multipart API, we stream a large object in parts and complete it as a single key. We inspect object versions, generate time-limited pre-signed URLs for uploads and downloads, and attach a lifecycle policy. We wire an S3 bucket to an SQS queue so that every upload emits an event notification we can consume. Finally, we treat S3 as a tiny analytics data lake: we partition a Pandas dataset into per-category objects, list and read them back, and compute an aggregate report, all without an AWS account, an auth token, or a single cent of cloud spend.
+
+Because Floci implements the same API responses that `boto3`, the AWS CLI, and Terraform expect, everything you write here transfers directly to real AWS by changing a single endpoint setting.
+
+## Starting Floci and Configuring the boto3 S3 Client
+
+```bash
+# Option A: the Floci CLI (recommended)
+curl -fsSL https://floci.io/install.sh | sh
+floci start
+
+# Option B: plain Docker
+docker run -d --name floci -p 4566:4566 floci/floci:latest
+
+# Point the AWS toolchain at the local emulator
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+```
+
+```python
+import io
+import os
+import json
+import time
+import hashlib
+import textwrap
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError
+
+FLOCI_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+# Floci accepts any non-empty credentials; "test"/"test" is the convention.
+SESSION = boto3.session.Session(
+    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+    region_name=REGION,
+)
+
+# Local emulators need path-style addressing (http://host:4566/bucket/key),
+# not virtual-host style (http://bucket.host:4566/key).
+S3_CONFIG = Config(
+    signature_version="s3v4",
+    s3={"addressing_style": "path"},
+    retries={"max_attempts": 3, "mode": "standard"},
+)
+
+def client(service):
+    return SESSION.client(service, endpoint_url=FLOCI_ENDPOINT, config=S3_CONFIG)
+
+s3 = client("s3")
+sqs = client("sqs")
+
+def wait_for_floci(timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s3.list_buckets()
+            print(f"Floci is ready at {FLOCI_ENDPOINT}")
+            return
+        except (EndpointConnectionError, ClientError):
+            time.sleep(1)
+    raise RuntimeError(f"Floci did not become ready at {FLOCI_ENDPOINT}")
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+wait_for_floci()
+```
+
+We begin by launching Floci (either through its one-line CLI or a single Docker command) and exporting the four environment variables that every AWS SDK understands. We then build a reusable `boto3` session and a `client()` factory that points every service at `http://localhost:4566`. Because we are talking to a local emulator, we explicitly select path-style S3 addressing, add SigV4 signing, and configure sensible retries. The `wait_for_floci` helper polls `list_buckets` until the emulator answers, which makes the script safe to run immediately after the container starts.
+
+## Creating a Bucket, Enabling Versioning, and Uploading Rich Objects
+
+```python
+BUCKET = "floci-demo-datalake"
+
+banner("Create bucket + enable versioning")
+
+def ensure_bucket(name, object_lock=False):
+    try:
+        kwargs = {"Bucket": name}
+        # us-east-1 must NOT send a LocationConstraint; every other region must.
+        if REGION != "us-east-1":
+            kwargs["CreateBucketConfiguration"] = {"LocationConstraint": REGION}
+        if object_lock:
+            kwargs["ObjectLockEnabledForBucket"] = True
+        s3.create_bucket(**kwargs)
+        print(f"Created bucket: {name}")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            print(f"Bucket already exists: {name}")
+        else:
+            raise
+
+ensure_bucket(BUCKET)
+
+s3.put_bucket_versioning(
+    Bucket=BUCKET,
+    VersioningConfiguration={"Status": "Enabled"},
+)
+
+status = s3.get_bucket_versioning(Bucket=BUCKET).get("Status")
+print("Versioning status:", status)
+
+def put_text_object(key, text, metadata=None, tags=None):
+    body = text.encode("utf-8")
+    kwargs = {
+        "Bucket": BUCKET,
+        "Key": key,
+        "Body": body,
+        "ContentType": "text/plain",
+        "ServerSideEncryption": "AES256",
+        "Metadata": metadata or {},
+        "ContentMD5": None,  # let boto3 skip; Floci validates the SigV4 signature
+    }
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    if tags:
+        kwargs["Tagging"] = "&".join(f"{k}={v}" for k, v in tags.items())
+    resp = s3.put_object(**kwargs)
+    print(f"PUT {key:32s} version={resp.get('VersionId')} etag={resp['ETag']}")
+    return resp
+
+put_text_object(
+    "notes/readme.txt",
+    "Floci serves the real S3 API locally. This object is server-side encrypted.",
+    metadata={"author": "tutorial", "stage": "draft"},
+    tags={"team": "data", "pii": "false"},
+)
+
+# Upload a second version of the same key to exercise versioning.
+put_text_object(
+    "notes/readme.txt",
+    "Second revision of the file, stored as a distinct S3 version.",
+    metadata={"author": "tutorial", "stage": "reviewed"},
+    tags={"team": "data", "pii": "false"},
+)
+```
+
+We create a versioned bucket and confirm the setting through `get_bucket_versioning`. The `ensure_bucket` helper handles the classic S3 gotcha where `us-east-1` must omit `LocationConstraint` while every other region must include it, and it swallows the "already owned by you" error so the script is idempotent. We then define `put_text_object`, which uploads text with user-defined metadata, object tags, and `AES256` server-side encryption in a single call. By writing the same key twice, we generate two independent object versions that we will inspect shortly.
+
+## Streaming a Large Object with the S3 Multipart Upload API
+
+```python
+banner("Multipart upload")
+
+MULTIPART_KEY = "datasets/large-events.log"
+PART_SIZE = 5 * 1024 * 1024  # 5 MiB, the S3 minimum part size (except the last part)
+TOTAL_PARTS = 3
+
+def synth_part(index: int) -> bytes:
+    line = f"event_id,ts,payload -- part {index}\n".encode("utf-8")
+    # Pad each part up to PART_SIZE with deterministic, compressible content.
+    filler = (f"row-{index:03d}," * 64 + "\n").encode("utf-8")
+    buf = bytearray(line)
+    while len(buf) < PART_SIZE:
+        buf.extend(filler)
+    return bytes(buf[:PART_SIZE])
+
+mpu = s3.create_multipart_upload(
+    Bucket=BUCKET,
+    Key=MULTIPART_KEY,
+    ContentType="text/csv",
+    ServerSideEncryption="AES256",
+)
+upload_id = mpu["UploadId"]
+print("Started multipart upload:", upload_id)
+
+parts = []
+try:
+    for i in range(1, TOTAL_PARTS + 1):
+        chunk = synth_part(i)
+        resp = s3.upload_part(
+            Bucket=BUCKET,
+            Key=MULTIPART_KEY,
+            PartNumber=i,
+            UploadId=upload_id,
+            Body=chunk,
+        )
+        parts.append({"PartNumber": i, "ETag": resp["ETag"]})
+        print(f"Uploaded part {i}: {len(chunk):,} bytes  etag={resp['ETag']}")
+
+    result = s3.complete_multipart_upload(
+        Bucket=BUCKET,
+        Key=MULTIPART_KEY,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": parts},
+    )
+    print("Completed multipart object:", result["Key"])
+except Exception:
+    s3.abort_multipart_upload(Bucket=BUCKET, Key=MULTIPART_KEY, UploadId=upload_id)
+    raise
+
+head = s3.head_object(Bucket=BUCKET, Key=MULTIPART_KEY)
+print(f"Final object size: {head['ContentLength']:,} bytes")
+print("Encryption:", head.get("ServerSideEncryption"))
+```
+
+We upload a large object the way production pipelines do: in independent parts that S3 stitches together on completion. We initiate the upload with `create_multipart_upload`, push three 5 MiB parts with `upload_part` while collecting each part's `ETag`, and finalize with `complete_multipart_upload`. We wrap the loop in a `try/except` that calls `abort_multipart_upload` on failure, which is the correct pattern for avoiding orphaned, billable parts on real AWS. A final `head_object` confirms the assembled size and that server-side encryption carried through.
+
+## Inspecting Versions, Listing Objects, and Reading Metadata
+
+```python
+banner("List versions and objects")
+
+versions = s3.list_object_versions(Bucket=BUCKET, Prefix="notes/")
+for v in versions.get("Versions", []):
+    latest = "(latest)" if v["IsLatest"] else ""
+    print(f"{v['Key']:24s} version={v['VersionId']:>12} size={v['Size']:>4} {latest}")
+
+# Fetch a specific historical version and read its custom metadata.
+oldest = min(versions["Versions"], key=lambda v: v["LastModified"])
+obj = s3.get_object(Bucket=BUCKET, Key=oldest["Key"], VersionId=oldest["VersionId"])
+print("\nOldest version body:")
+print(" ", obj["Body"].read().decode("utf-8"))
+print("Oldest version metadata:", obj["Metadata"])
+
+# Read the tags attached to the current object.
+tags = s3.get_object_tagging(Bucket=BUCKET, Key="notes/readme.txt")
+print("Current tags:", {t["Key"]: t["Value"] for t in tags["TagSet"]})
+
+banner("Paginated listing of the whole bucket")
+paginator = s3.get_paginator("list_objects_v2")
+total = 0
+for page in paginator.paginate(Bucket=BUCKET):
+    for item in page.get("Contents", []):
+        total += 1
+        print(f"{item['Key']:40s} {item['Size']:>10,} bytes")
+print(f"Total objects: {total}")
+```
+
+We use `list_object_versions` to see both revisions of `notes/readme.txt` and identify which one is current. We then pull the oldest version by its `VersionId` and read back both its body and the custom metadata we attached earlier, demonstrating that Floci preserves per-version state exactly like S3. We also fetch object tags and, finally, walk the entire bucket with a paginator, the same construct you would use against real S3 to iterate over millions of keys without loading them all into memory.
+
+## Generating Pre-Signed URLs and Attaching a Lifecycle Policy
+
+```python
+banner("Pre-signed URLs")
+
+# A time-limited GET URL anyone can use without AWS credentials.
+get_url = s3.generate_presigned_url(
+    "get_object",
+    Params={"Bucket": BUCKET, "Key": "notes/readme.txt"},
+    ExpiresIn=3600,
+)
+print("Pre-signed GET URL:\n ", get_url)
+
+# A pre-signed PUT URL for browser/direct uploads.
+put_url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": BUCKET, "Key": "uploads/from-presigned.txt"},
+    ExpiresIn=3600,
+)
+print("Pre-signed PUT URL:\n ", put_url)
+
+# Exercise the URLs with a plain HTTP client (no boto3, no credentials).
+import urllib.request
+
+payload = b"Uploaded through a pre-signed URL, zero SDK config required."
+req = urllib.request.Request(put_url, data=payload, method="PUT")
+with urllib.request.urlopen(req) as r:
+    print("Pre-signed PUT status:", r.status)
+
+with urllib.request.urlopen(get_url) as r:
+    print("Pre-signed GET body:", r.read().decode("utf-8"))
+
+banner("Lifecycle policy")
+s3.put_bucket_lifecycle_configuration(
+    Bucket=BUCKET,
+    LifecycleConfiguration={
+        "Rules": [
+            {
+                "ID": "expire-temp-uploads",
+                "Filter": {"Prefix": "uploads/"},
+                "Status": "Enabled",
+                "Expiration": {"Days": 7},
+            },
+            {
+                "ID": "clean-old-versions",
+                "Filter": {"Prefix": ""},
+                "Status": "Enabled",
+                "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
+            },
+        ]
+    },
+)
+rules = s3.get_bucket_lifecycle_configuration(Bucket=BUCKET)["Rules"]
+print("Active lifecycle rules:", [r["ID"] for r in rules])
+```
+
+We generate two pre-signed URLs, one for downloading and one for uploading, each valid for one hour. To prove they are self-contained, we drive them with Python's built-in `urllib` rather than `boto3`: the PUT URL accepts a raw byte payload, and the GET URL returns the object body, all without any AWS credentials on the client side. We then attach a lifecycle configuration that expires temporary uploads after seven days and clears noncurrent object versions after thirty, the standard way to keep a versioned bucket from growing without bound.
+
+## Wiring S3 Event Notifications to an SQS Queue
+
+```python
+banner("S3 -> SQS event notifications")
+
+QUEUE_NAME = "s3-object-created"
+queue_url = sqs.create_queue(QueueName=QUEUE_NAME)["QueueUrl"]
+queue_arn = sqs.get_queue_attributes(
+    QueueUrl=queue_url, AttributeNames=["QueueArn"]
+)["Attributes"]["QueueArn"]
+print("Queue ARN:", queue_arn)
+
+s3.put_bucket_notification_configuration(
+    Bucket=BUCKET,
+    NotificationConfiguration={
+        "QueueConfigurations": [
+            {
+                "QueueArn": queue_arn,
+                "Events": ["s3:ObjectCreated:*"],
+                "Filter": {
+                    "Key": {"FilterRules": [{"Name": "prefix", "Value": "incoming/"}]}
+                },
+            }
+        ]
+    },
+)
+print("Notification wired for prefix 'incoming/'")
+
+# Trigger an event by uploading under the watched prefix.
+put_text_object("incoming/order-1001.json",
+                json.dumps({"order_id": 1001, "total": 42.5}))
+
+# Poll SQS for the resulting S3 event.
+messages = sqs.receive_message(
+    QueueUrl=queue_url, MaxNumberOfMessages=5, WaitTimeSeconds=5
+).get("Messages", [])
+
+for m in messages:
+    event = json.loads(m["Body"])
+    for rec in event.get("Records", []):
+        s3info = rec["s3"]
+        print("Event:", rec["eventName"],
+              "->", s3info["bucket"]["name"] + "/" + s3info["object"]["key"])
+    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=m["ReceiptHandle"])
+
+print(f"Consumed {len(messages)} S3 event message(s)")
+```
+
+We connect two services the way an event-driven pipeline would. We create an SQS queue, read back its ARN, and register a bucket notification that fires `s3:ObjectCreated:*` events only for keys under the `incoming/` prefix. Uploading a JSON order into that prefix causes Floci to deliver an S3 event record to the queue, which we then receive, parse, and acknowledge with `delete_message`. This is the exact contract AWS uses, so the same code powers real S3-to-SQS fan-out in production.
+
+## Building an S3-Backed Data Lake and Running the Full Pipeline
+
+```python
+banner("S3-backed mini data lake")
+
+# A tiny dataset we partition by category, one object per partition.
+records = [
+    {"category": "books", "sku": "B-1", "price": 12.0, "qty": 3},
+    {"category": "books", "sku": "B-2", "price": 18.0, "qty": 1},
+    {"category": "audio", "sku": "A-1", "price": 99.0, "qty": 2},
+    {"category": "audio", "sku": "A-2", "price": 149.0, "qty": 1},
+    {"category": "home", "sku": "H-1", "price": 24.5, "qty": 5},
+]
+
+def rows_for(category):
+    return [r for r in records if r["category"] == category]
+
+categories = sorted({r["category"] for r in records})
+for cat in categories:
+    partition = rows_for(cat)
+    body = "\n".join(json.dumps(r) for r in partition).encode("utf-8")
+    key = f"lake/orders/category={cat}/data.jsonl"
+    s3.put_object(
+        Bucket=BUCKET, Key=key, Body=body,
+        ContentType="application/x-ndjson", ServerSideEncryption="AES256",
+    )
+    print(f"Wrote partition {key} ({len(partition)} rows)")
+
+# Read every partition back and compute an aggregate report.
+report = {}
+resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="lake/orders/")
+for item in resp.get("Contents", []):
+    data = s3.get_object(Bucket=BUCKET, Key=item["Key"])["Body"].read().decode()
+    for line in filter(None, data.splitlines()):
+        r = json.loads(line)
+        stats = report.setdefault(r["category"], {"revenue": 0.0, "units": 0})
+        stats["revenue"] += r["price"] * r["qty"]
+        stats["units"] += r["qty"]
+
+banner("Aggregate revenue report")
+for cat in sorted(report):
+    print(f"{cat:8s} revenue=${report[cat]['revenue']:>8.2f} "
+          f"units={report[cat]['units']}")
+
+# Persist the report itself back to S3 as the pipeline's output artifact.
+s3.put_object(
+    Bucket=BUCKET,
+    Key=f"lake/reports/summary-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}.json",
+    Body=json.dumps(report, indent=2).encode("utf-8"),
+    ContentType="application/json",
+)
+print("\nPipeline complete. Report written to lake/reports/.")
+```
+
+We finish by treating S3 as a small analytical data lake. We partition an in-memory dataset by `category` and write one newline-delimited JSON object per partition under a Hive-style `category=<value>/` prefix, the layout that engines like Athena, Spark, and DuckDB expect. We then list the partitions, stream each one back, and roll the rows up into a per-category revenue and units report. Finally, we persist that report as its own timestamped S3 object, closing the loop on a complete read-transform-write pipeline that never left the local machine.
+
+## Conclusion
+
+In conclusion, we have a complete Amazon S3 workflow that runs locally on Floci and transfers to real AWS with a one-line endpoint change. We started a credential-free emulator, configured a path-style `boto3` client, and exercised the S3 features that real systems depend on: versioned buckets, metadata, object tags, and server-side encryption; multipart uploads with proper abort handling; version inspection and paginated listing; pre-signed upload and download URLs consumed without any SDK; lifecycle policies for cost control; S3-to-SQS event notifications for event-driven processing; and a partitioned, S3-backed data lake with a read-transform-write reporting pipeline. Because Floci mirrors the AWS wire protocol, every call we made here is production-accurate, which means we can iterate and test entire S3 pipelines fast, offline, and for free before pointing the same code at the cloud.
+
+---
+
+*Check out the [Floci GitHub repo](https://github.com/floci-io/floci) and the [Floci docs](https://floci.io/). All the code in this tutorial runs against a local Floci container on `http://localhost:4566`, so you can copy it into a single Python file and run it end to end.*

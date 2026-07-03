@@ -1,0 +1,193 @@
+# floci-gcp for Python: Create a Cloud Storage Bucket and Manage Objects Locally with Versioning, Metadata, Streaming, Listing, and Compose
+
+In this tutorial, we build a complete Google Cloud Storage (GCS) workflow that runs entirely on our own machine using **floci-gcp**, a free, open-source, drop-in local Google Cloud emulator that speaks the real GCP wire protocols on `http://localhost:4588`. We begin by starting a floci-gcp container and pointing the official `google-cloud-storage` Python client at the emulator with a single environment variable, so the exact same code runs against real GCP by removing that variable. We then create a bucket, enable object versioning, and upload objects from in-memory strings and from a local file, attaching content types and custom metadata. We download objects back as text and stream them to disk, read object properties and generations, and list a bucket with a prefix to walk a virtual folder. We compose several objects into one, overwrite an object to create a new version, and finally delete objects and the bucket, closing the loop on a full create-and-manage lifecycle, all without a Google Cloud account, a service-account key, or a single cent of cloud spend.
+
+Because floci-gcp implements the same REST responses that the GCP client libraries expect, everything you write here transfers directly to real Cloud Storage by pointing the client at Google instead of the emulator.
+
+## Starting floci-gcp and Connecting the Storage Client
+
+```bash
+# Start the local GCP emulator (all services share port 4588)
+docker run -d --name floci-gcp -p 4588:4588 floci/floci-gcp:latest
+
+# Confirm it is healthy
+curl http://localhost:4588/health
+
+# Install the official Cloud Storage client
+pip install google-cloud-storage
+```
+
+```python
+import os
+import time
+
+# IMPORTANT: set the emulator host BEFORE importing/creating the client.
+# For Cloud Storage the value MUST include the http:// scheme.
+os.environ["STORAGE_EMULATOR_HOST"] = "http://localhost:4588"
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "floci-local")
+
+from google.cloud import storage
+from google.api_core.exceptions import Conflict, NotFound
+
+PROJECT = "floci-local"
+BUCKET = "floci-demo-objects"
+
+client = storage.Client(project=PROJECT)
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_floci(timeout: int = 60):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            list(client.list_buckets())
+            print(f"floci-gcp Storage is ready at {os.environ['STORAGE_EMULATOR_HOST']}")
+            return
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise RuntimeError(f"floci-gcp did not become ready: {last}")
+
+wait_for_floci()
+```
+
+We begin by launching floci-gcp with a single `docker run` command that exposes port `4588`, then set `STORAGE_EMULATOR_HOST` (including the `http://` scheme, which the storage client requires) before creating the `google-cloud-storage` client. Setting that variable is all it takes for the client to talk to the emulator and skip credential validation, so `storage.Client(project="floci-local")` connects locally with no service-account key. The `wait_for_floci` helper polls `list_buckets` until the emulator answers so the script is safe to run immediately after startup.
+
+## Creating a Bucket and Enabling Versioning
+
+```python
+banner("Create bucket + enable versioning")
+
+def ensure_bucket(name: str):
+    try:
+        bucket = client.create_bucket(name)
+        print(f"Created bucket: {name}")
+    except Conflict:
+        bucket = client.bucket(name)
+        print(f"Bucket already exists: {name}")
+    return bucket
+
+bucket = ensure_bucket(BUCKET)
+
+# Turn on object versioning so overwritten/deleted objects keep prior generations.
+bucket.versioning_enabled = True
+bucket.patch()
+bucket.reload()
+print("Versioning enabled:", bucket.versioning_enabled)
+```
+
+We create the bucket with an idempotent `ensure_bucket` helper that catches `Conflict` (the error GCS raises when a bucket already exists) so the script can be re-run safely. We then enable object versioning by setting `versioning_enabled` and calling `patch()` to persist the change, followed by `reload()` to confirm it. With versioning on, every overwrite or delete preserves the previous object generation, which is the foundation for point-in-time recovery in GCS.
+
+## Uploading Objects from Strings and Files
+
+```python
+banner("Upload objects")
+
+# 1) Upload text with a content type and custom metadata.
+readme = bucket.blob("notes/readme.txt")
+readme.content_type = "text/plain"
+readme.metadata = {"author": "tutorial", "stage": "draft"}
+readme.upload_from_string(
+    "floci-gcp serves the real Cloud Storage API locally.\n",
+    content_type="text/plain",
+)
+print("Uploaded notes/readme.txt")
+
+# 2) Create a local file, then upload it as an object.
+local_path = "sample-data.csv"
+with open(local_path, "w", encoding="utf-8") as f:
+    f.write("id,category,amount\n")
+    for i in range(1, 6):
+        f.write(f"{i},cat-{i % 3},{i * 12.5}\n")
+
+data_blob = bucket.blob("datasets/sample-data.csv")
+data_blob.upload_from_filename(local_path, content_type="text/csv")
+print("Uploaded datasets/sample-data.csv from a local file")
+
+# 3) Overwrite the readme to create a second generation.
+readme.upload_from_string("Second revision of the readme.\n", content_type="text/plain")
+print("Overwrote notes/readme.txt (new generation)")
+```
+
+We upload objects three ways. First, we create a `blob` for `notes/readme.txt`, attach a content type and a custom metadata dictionary, and push text with `upload_from_string`. Second, we generate a local CSV file and upload it directly with `upload_from_filename`, which streams the file so it works for large payloads. Third, we overwrite the readme with new content; because versioning is enabled, GCS keeps the original as a noncurrent generation rather than discarding it.
+
+## Downloading, Reading Properties, and Listing
+
+```python
+banner("Download + properties + list")
+
+# Download fully into memory as text.
+text = bucket.blob("notes/readme.txt").download_as_text()
+print("Downloaded notes/readme.txt:", text.strip())
+
+# Stream an object to a local file.
+out_path = "downloaded-sample-data.csv"
+bucket.blob("datasets/sample-data.csv").download_to_filename(out_path)
+print(f"Streamed datasets/sample-data.csv -> {out_path} "
+      f"({os.path.getsize(out_path)} bytes)")
+
+# Read properties/metadata for a single object.
+props = bucket.get_blob("notes/readme.txt")
+print("readme size       :", props.size)
+print("readme content_type:", props.content_type)
+print("readme generation :", props.generation)
+print("readme metadata   :", props.metadata)
+
+# List objects, then filter by prefix (a virtual folder).
+print("\nAll objects:")
+for b in client.list_blobs(BUCKET):
+    print(f"  {b.name:32s} {b.size:>6} bytes")
+
+print("Objects under 'datasets/':")
+for b in client.list_blobs(BUCKET, prefix="datasets/"):
+    print(f"  {b.name}")
+```
+
+We download the readme fully into memory with `download_as_text`, and stream the CSV to disk with `download_to_filename` so arbitrarily large objects never need to fit in RAM. We fetch a single object's server-side properties with `get_blob`, reading its size, content type, generation number, and custom metadata. We then enumerate the bucket with `list_blobs`, first listing everything and then passing `prefix="datasets/"` to walk a virtual folder, since GCS object names are flat and "folders" are just name prefixes.
+
+## Composing Objects and Cleaning Up
+
+```python
+banner("Compose + delete + cleanup")
+
+# Compose (concatenate) multiple objects into one new object.
+part_a = bucket.blob("parts/a.txt")
+part_a.upload_from_string("HEADER\n")
+part_b = bucket.blob("parts/b.txt")
+part_b.upload_from_string("BODY\n")
+
+combined = bucket.blob("parts/combined.txt")
+combined.compose([part_a, part_b])
+print("Composed parts/combined.txt:", combined.download_as_text().strip().replace("\n", " | "))
+
+# Delete a single object.
+bucket.blob("notes/readme.txt").delete()
+print("Deleted notes/readme.txt")
+
+# Delete the whole bucket and everything in it.
+try:
+    bucket.delete(force=True)
+    print(f"Deleted bucket: {BUCKET}")
+except NotFound:
+    print(f"Bucket already gone: {BUCKET}")
+
+# Tidy local scratch files.
+for path in (local_path, out_path):
+    if os.path.exists(path):
+        os.remove(path)
+print("Local scratch files removed. Storage workflow complete.")
+```
+
+We finish by exercising two more GCS capabilities. We upload two small parts and merge them server-side into a single object with `compose`, the native GCS operation for concatenating objects without downloading and re-uploading them. We then delete a single object with `delete`, and remove the entire bucket with `bucket.delete(force=True)`, which deletes all contained objects first, wrapped in a `NotFound` guard so cleanup is idempotent. Finally we remove the temporary local files we created.
+
+## Conclusion
+
+In conclusion, we have a complete Google Cloud Storage workflow that runs locally on floci-gcp and transfers to real GCP by simply not pointing at the emulator. We started a credential-free emulator, connected the official `google-cloud-storage` client with one environment variable, and exercised the operations that real applications depend on: creating a bucket; enabling versioning; uploading from strings and files with content types and metadata; downloading into memory and streaming to disk; reading object properties and generations; listing with prefix-based virtual folders; composing objects server-side; and deleting objects and buckets. Because floci-gcp mirrors the Cloud Storage wire protocol, every call we made here is production-accurate, which means we can build and test entire storage pipelines fast, offline, and for free before running the same code against the cloud.
+
+---
+
+*Check out the [floci-gcp GitHub repo](https://github.com/floci-io/floci-gcp) and the [floci-gcp docs](https://floci.io/floci-gcp/). All the code in this tutorial runs against a local floci-gcp container on `http://localhost:4588`, so you can copy it into a single Python file and run it end to end.*

@@ -1,0 +1,193 @@
+# floci-az for Python: Send and Process Azure Queue Storage Messages Locally with Visibility Timeouts, Peeking, and a Producer/Consumer Loop
+
+In this tutorial, we build a complete Azure Queue Storage workflow that runs entirely on our own machine using **floci-az**, a free, open-source, drop-in local Azure emulator that speaks the real Azure Storage REST protocol on `http://localhost:4577`. We begin by starting a floci-az container and connecting the official `azure-storage-queue` Python SDK with the standard development connection string, so the exact same code runs against real Azure by swapping one endpoint. We then create a queue and send both plain and structured JSON messages, some with a delayed visibility so they only appear later. We peek at messages without dequeuing them, then receive them with a visibility timeout that hides each message from other consumers while it is being processed. We update an in-flight message to extend its lease, delete messages after successful processing to acknowledge them, and check the queue's approximate length. Finally, we assemble a realistic producer/consumer loop that drains the queue reliably, closing the loop on a full send-and-process message lifecycle, all without an Azure subscription, an auth token, or a single cent of cloud spend.
+
+Because floci-az implements the same REST responses that the Azure SDKs and the Azure CLI expect, everything you write here transfers directly to Azure Queue Storage by changing only the connection string.
+
+## Starting floci-az and Connecting the Queue Service Client
+
+```bash
+# Start the local Azure emulator (Blob, Queue, and Table on a single port)
+docker run -d --name floci-az \
+  -p 4577:4577 \
+  -e FLOCI_AZ_SERVICES_FUNCTIONS_ENABLED=false \
+  floci/floci-az:latest
+
+# Confirm it is healthy
+curl http://localhost:4577/health
+
+# Install the official Azure Queue SDK
+pip install azure-storage-queue
+```
+
+```python
+import json
+import time
+from azure.storage.queue import QueueServiceClient
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+
+# The standard Azurite-compatible development connection string.
+# Note the Queue endpoint uses the '-queue' path suffix that floci-az routes on.
+CONNECTION_STRING = (
+    "DefaultEndpointsProtocol=http;"
+    "AccountName=devstoreaccount1;"
+    "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
+    "K1SZFPTOtr/KBHBeksoGMh0==;"
+    "QueueEndpoint=http://localhost:4577/devstoreaccount1-queue;"
+)
+
+QUEUE_NAME = "order-events"
+
+def banner(title: str):
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+
+def wait_for_queue(service: QueueServiceClient, timeout: int = 60):
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            list(service.list_queues())
+            print("floci-az Queue endpoint is ready")
+            return
+        except Exception as e:  # emulator still booting
+            last_err = e
+            time.sleep(1)
+    raise RuntimeError(f"floci-az did not become ready: {last_err}")
+
+service = QueueServiceClient.from_connection_string(CONNECTION_STRING)
+wait_for_queue(service)
+```
+
+We begin by launching floci-az with a single `docker run` command that exposes port `4577`, disabling the Functions runtime since this tutorial only needs Queue storage. We then build a `QueueServiceClient` from the standard development connection string, taking care that the `QueueEndpoint` carries the `-queue` path suffix (`http://localhost:4577/devstoreaccount1-queue`) that floci-az uses to route queue traffic. The `wait_for_queue` helper polls `list_queues` until the emulator responds, so the script is safe to run the moment the container starts.
+
+## Creating a Queue and Sending Messages
+
+```python
+banner("Create queue + send messages")
+
+def ensure_queue(name: str):
+    try:
+        service.create_queue(name)
+        print(f"Created queue: {name}")
+    except ResourceExistsError:
+        print(f"Queue already exists: {name}")
+    return service.get_queue_client(name)
+
+queue = ensure_queue(QUEUE_NAME)
+
+# 1) Send a few structured JSON messages (the SDK accepts str payloads).
+orders = [
+    {"order_id": 1001, "sku": "A-1", "qty": 2},
+    {"order_id": 1002, "sku": "B-7", "qty": 1},
+    {"order_id": 1003, "sku": "C-3", "qty": 5},
+]
+for order in orders:
+    receipt = queue.send_message(json.dumps(order))
+    print(f"Sent order {order['order_id']}  message_id={receipt.id}")
+
+# 2) Send a delayed message: it stays invisible for 5 seconds before it can be received.
+queue.send_message(
+    json.dumps({"order_id": 2001, "sku": "DELAYED", "qty": 1}),
+    visibility_timeout=5,
+)
+print("Sent a delayed message (visible in 5s)")
+
+# 3) Send a message with a time-to-live so it auto-expires if never processed.
+queue.send_message(
+    json.dumps({"order_id": 3001, "sku": "SHORT-LIVED", "qty": 1}),
+    time_to_live=3600,  # seconds
+)
+print("Sent a message with a 1-hour TTL")
+```
+
+We create the queue with an idempotent `ensure_queue` helper that tolerates `ResourceExistsError`. We then enqueue messages in three flavors that cover common patterns: three structured JSON orders serialized with `json.dumps`; one delayed message whose `visibility_timeout` keeps it hidden for five seconds so it is processed later; and one message with an explicit `time_to_live`, after which Azure automatically discards it if no consumer has handled it. Each `send_message` call returns a receipt carrying the server-assigned message ID.
+
+## Peeking, Counting, and Receiving with a Visibility Timeout
+
+```python
+banner("Peek, count, and receive")
+
+# Peek does NOT dequeue or hide messages; it is a read-only preview.
+peeked = queue.peek_messages(max_messages=5)
+print("Peeked (still available to others):")
+for m in peeked:
+    print("  ", m.content)
+
+# Approximate message count is exposed on the queue properties.
+props = queue.get_queue_properties()
+print("Approximate message count:", props.approximate_message_count)
+
+# Receive hides each returned message for `visibility_timeout` seconds so that
+# no other consumer can grab it while we work on it.
+received = queue.receive_messages(max_messages=2, visibility_timeout=30)
+for msg in received:
+    order = json.loads(msg.content)
+    print(f"Received order {order['order_id']} "
+          f"(dequeue_count={msg.dequeue_count})")
+
+    # If processing needs more time, extend the lease with update_message.
+    # update_message issues a NEW pop receipt, so we keep the returned handle
+    # and use it for the subsequent delete (the old receipt is now invalid).
+    updated = queue.update_message(msg, visibility_timeout=60)
+    print(f"  Extended visibility lease for message {msg.id}")
+
+    # Acknowledge successful processing by deleting the message.
+    queue.delete_message(updated)
+    print(f"  Deleted (acknowledged) message {msg.id}")
+```
+
+We inspect the queue without consuming it using `peek_messages`, which returns a read-only preview that leaves every message available to other consumers. We read the queue's `approximate_message_count` from its properties, the standard way to gauge backlog depth. We then `receive_messages` with a thirty-second `visibility_timeout`, which leases each returned message and hides it from other consumers while we process it. For long-running work we call `update_message` to extend that lease; because that call issues a fresh pop receipt, we keep the returned handle and pass it to `delete_message` to acknowledge the message once it is handled — the exact at-least-once processing contract Azure Queue Storage guarantees.
+
+## Building a Reliable Producer/Consumer Loop
+
+```python
+banner("Producer/consumer drain loop")
+
+# Use a dedicated queue for this task workload so it stays isolated from the
+# order-events queue we used above.
+task_queue = ensure_queue("task-jobs")
+
+# Producer: enqueue a fresh batch of work.
+for i in range(1, 6):
+    task_queue.send_message(json.dumps({"task_id": i, "payload": f"work-{i}"}))
+print("Enqueued 5 tasks")
+
+# Consumer: drain the queue in batches until it is empty.
+processed = 0
+empty_polls = 0
+while empty_polls < 2:  # two consecutive empty polls means we are done
+    batch = list(task_queue.receive_messages(max_messages=10, visibility_timeout=30))
+    if not batch:
+        empty_polls += 1
+        time.sleep(1)
+        continue
+    empty_polls = 0
+    for msg in batch:
+        task = json.loads(msg.content)
+        # ... do the real work here ...
+        print(f"Processing task {task['task_id']}: {task['payload']}")
+        task_queue.delete_message(msg)
+        processed += 1
+
+print(f"\nDrained the queue. Total tasks processed: {processed}")
+
+# Clean up both queues.
+for name in (QUEUE_NAME, "task-jobs"):
+    try:
+        service.delete_queue(name)
+        print(f"Deleted queue: {name}")
+    except ResourceNotFoundError:
+        print(f"Queue already gone: {name}")
+```
+
+We finish by assembling the pattern most real systems use, on a dedicated `task-jobs` queue so the workload stays isolated from the order events above. A producer enqueues a batch of task messages, and a consumer repeatedly pulls up to ten messages at a time, processes each, and deletes it to acknowledge completion. We treat two consecutive empty polls as the signal that the queue is drained, a simple and robust termination condition that tolerates the eventual consistency of message visibility. After the loop, we delete both queues with a `ResourceNotFoundError` guard so the teardown is idempotent.
+
+## Conclusion
+
+In conclusion, we have a complete Azure Queue Storage workflow that runs locally on floci-az and transfers to real Azure with a one-line connection-string change. We started a credential-free emulator, connected the official `azure-storage-queue` SDK, and exercised the operations that real messaging systems depend on: creating queues; sending plain, delayed, and TTL-bounded messages; peeking without dequeuing; reading the approximate backlog depth; receiving messages under a visibility timeout; extending in-flight leases with `update_message`; acknowledging work with `delete_message`; and draining the queue with a reliable producer/consumer loop. Because floci-az mirrors the Azure Storage wire protocol, every call we made here is production-accurate, which means we can build and test entire event-driven pipelines fast, offline, and for free before pointing the same code at the cloud.
+
+---
+
+*Check out the [floci-az GitHub repo](https://github.com/floci-io/floci-az) and the [floci-az docs](https://floci.io/floci-az/). All the code in this tutorial runs against a local floci-az container on `http://localhost:4577`, so you can copy it into a single Python file and run it end to end.*
