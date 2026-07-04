@@ -172,27 +172,9 @@
     </div>
     <div class="content" id="content"></div>
     <footer>
-  <div style="margin-bottom:8px;">
-    <strong>Author:</strong> Vaishnavi Vasudevshetti
-  </div>
-
-  <div style="margin-bottom:8px;">
-    Voluntary Research Assistant · University of Southern California
-  </div>
-
-  <div style="margin-bottom:12px;">
-    <a href="https://www.linkedin.com/in/vaishnavi-vasudevshetti/"
-       target="_blank" rel="noopener">
-       LinkedIn Profile
-    </a>
-  </div>
-
-  Built with the free, open-source
-  <a href="https://github.com/floci-io/floci" target="_blank" rel="noopener">
-    Floci
-  </a>
-  local cloud emulators. Tutorials render from local <code>.txt</code> files.
-</footer>
+      Built with the free, open-source <a href="https://github.com/floci-io/floci" target="_blank" rel="noopener">Floci</a>
+      local cloud emulators. Tutorials render from local <code>.txt</code> files.
+    </footer>
   </main>
 </div>
 
@@ -257,12 +239,43 @@
     contentEl.innerHTML = `
       <div class="hero">
         <div class="kicker">Local cloud, zero cost</div>
-        <h1>Build on AWS, Azure &amp; GCP — entirely on your machine</h1>
-        <p>Ten hands-on Python tutorials that run against the free, open-source
-        <a href="https://github.com/floci-io/floci" target="_blank" rel="noopener">Floci</a> emulators.
-        No cloud account, no auth token, no bill. Every example transfers to the real cloud by changing one endpoint.</p>
-      </div>
-      <div class="cards">${cards}</div>`;
+
+        <h1>Build on AWS, Azure &amp; GCP entirely on your machine</h1>
+
+        <p>
+          Ten hands-on Python tutorials that run against the free, open-source
+          <a href="https://github.com/floci-io/floci" target="_blank" rel="noopener">Floci</a>
+          emulators. No cloud account, no auth token, no bill. Every example transfers
+          to the real cloud by changing one endpoint.
+        </p>
+
+        <div style="margin-top:24px;padding:20px;background:var(--panel);
+        border:1px solid var(--border);border-radius:12px;
+        display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+
+          <img src="assets/vaishnavi.jpeg"
+              alt="Vaishnavi Vasudevshetti"
+              style="width:120px;height:120px;border-radius:50%;
+                      object-fit:cover;border:3px solid var(--accent);">
+
+          <div>
+            <h3 style="margin:0 0 10px;">Vaishnavi Vasudevshetti</h3>
+
+            <p style="margin:0;color:var(--muted);">
+              Research Assistant<br>
+              University of Southern California (USC)
+            </p>
+
+            <p style="margin-top:12px;">
+              <a href="https://www.linkedin.com/in/vaishnavi-vasudevshetti/"
+                target="_blank">
+                🔗 LinkedIn Profile
+              </a>
+            </p>
+          </div>
+
+        </div>
+      <div class="cards">${cards}</div>`;    
     window.scrollTo(0, 0);
   }
 
